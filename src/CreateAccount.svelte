@@ -80,6 +80,7 @@ const submit = () =>{
                         localStorage.setItem('authToken', response_obj.authToken);
                         localStorage.setItem('privateKey', key_pair.privateKey);
                         localStorage.setItem('publicKey', key_pair.publicKey);
+                        localStorage.setItem('username', username);
                         window.location.href = "/";
                     }
                     else if(response_obj.hasOwnProperty('error')){

@@ -65,7 +65,6 @@ const submit = () => {
                     if(auth_req.readyState == XMLHttpRequest.DONE){
                         if(auth_req.status === 200){
                             let response_obj = JSON.parse(auth_req.response);
-                            console.log(response_obj);
                             if(response_obj.hasOwnProperty('error')){
                                 return submit_err_handler(new Error(response_obj.error));
                             }
@@ -73,6 +72,7 @@ const submit = () => {
                             //possibly rethink how private key is stored
                             localStorage.setItem('privateKey', key_pair.privateKey);
                             localStorage.setItem('publicKey', key_pair.publicKey);
+                            localStorage.setItem('username', username);
                             window.location.href = "/";
                         }
                         else{submit_err_handler(new Error('Error with authentication'));}
@@ -91,7 +91,7 @@ const submit = () => {
 <form on:submit|preventDefault={submit}>
 Username:<input type="text" bind:value={username}><br>
 Password:<input type="password" bind:value={password}><br>
-<button type="sumbit">Log In</button>
+<button type="submit">Log In</button>
 </form>
 <form action="/create_account">
     <input type="submit" value="Create Account">

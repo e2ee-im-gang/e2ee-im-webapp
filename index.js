@@ -26,6 +26,12 @@ const db = new sqlite3.Database('db/central.db', sqlite3.OPEN_READWRITE, (err)=>
 
 //const secrets = require('./secrets.js')
 
+//global costants
+const cookie_authToken = 'e2ee-im-gang-authToken';
+const cookie_publicKey = 'e2ee-im-gang-publicKey';
+const token_valid_ms = 24*60*60*1000;
+const token_refresh_ms = 60*60*1000;
+
 const generate_salt = () =>{
     let char_buf = Buffer.alloc(1);
     crypto.randomFillSync(char_buf);
@@ -41,6 +47,37 @@ const generate_auth_token = () =>{
     crypto.randomFillSync(rv_buf);
     return rv_buf.toString('hex');
 };
+
+//returns -1 for invalid auth token
+//returns userID for valid token
+async function verify_auth_token(token){
+    let rv_promise = new Promise(async(res, rej)=>{
+        let promise = new Promise((res, rej)=>{
+            db.get('select UserID, expiration from AuthTokens where token=?', [token], (err, row)=>{
+                if(err) throw err;
+                if(!row){return res(-1);}
+                if(row.expiration < (new Date()).getTime()){return res(-1);}
+                if(row.expiration < (new Date()).getTime() + token_valid_ms - token_refresh_ms){
+                    const new_expiration = (new Date()).getTime() + token_valid_ms;
+                    db.run('update AuthTokens set expiration=? where token=?', [new_expiration, token], (err)=>{
+                        if(err) console.error(err.message);
+                    });
+                }
+                res(row.UserID);
+            });
+        });
+        let rv;
+        try{
+            rv = await promise;
+        }
+        catch (err){
+            console.error(err.message);
+            rv = -1;
+        }
+        res(rv);
+    });
+    return rv_promise;
+}
 
 /*  Parameters:
         req: request object from post request
@@ -87,12 +124,6 @@ const is_bad_request = (req, attr_mapping) =>{
     }
     return false;
 };
-
-//global costants
-const cookie_authToken = 'e2ee-im-gang-authToken';
-const cookie_publicKey = 'e2ee-im-gang-publicKey';
-const token_valid_seconds = 24*60*60;
-const token_refresh_seconds = 60*60;
 
 app.use(express.static('public'));
 app.use(bodyParser.urlencoded({extended:false}));
@@ -153,7 +184,8 @@ app.post('/salts_req', (req, res)=>{
         if(!req.body.hasOwnProperty('username')){
             return res.status(400).end();
         }
-        db.get('select client_salt, keygen_salt from Users where username=?', [req.body.username], (err, row)=>{
+        const username = req.body.username.toLowerCase();
+        db.get('select client_salt, keygen_salt from Users where username=?', [username], (err, row)=>{
             if(err){return res.status(500).end();}
             if(!row){return res.send({error:'user does not exist'});}
             res.send({clientSalt:row.client_salt, keygenSalt:row.keygen_salt});
@@ -167,6 +199,23 @@ app.post('/salts_req', (req, res)=>{
     else{return res.status(400).end();}
 });
 
+app.post('/user_req', async (req, res)=>{
+    const attr_mapping = {
+        required:{
+            'authToken':'string'
+        },
+        optional:{}
+    };
+    if(is_bad_request(req, attr_mapping)){return res.status(400).end();}
+    let verification_promise = verify_auth_token(req.body.authToken);
+    const user_id = await verification_promise;
+    if(user_id == -1) return res.status(403).end();
+    db.get('select username from Users where UserID=?', [user_id], (err, row) =>{
+        if(err) return res.status(500).end();
+        res.send({username:row.username});
+    });
+});
+
 app.post('/auth_req', (req, res)=>{
     const attr_mapping = {
         required:{
@@ -178,7 +227,8 @@ app.post('/auth_req', (req, res)=>{
     };
     const inval_login = ()=>{res.send({error:"invalid login credentials"});}
     if(is_bad_request(req, attr_mapping)){return res.status(400).end();}
-    db.get('select hash, server_salt, UserID, pw_public_key from Users where username=?', [req.body.username], (err, row)=>{
+    const username = req.body.username.toLowerCase();
+    db.get('select hash, server_salt, UserID, pw_public_key from Users where username=?', [username], (err, row)=>{
         if(err){console.error(err.message);return res.status(500).end();}
         if(!row){return inval_login();}
         const pw_hash = new SHA3(256);
@@ -186,7 +236,7 @@ app.post('/auth_req', (req, res)=>{
         const hex_pw_hash = pw_hash.digest('hex');
         if(hex_pw_hash != row.hash){return inval_login();}
         let token = generate_auth_token();
-        const expiration = (new Date()).getTime() + token_valid_seconds;
+        const expiration = (new Date()).getTime() + token_valid_ms;
         const user_id = row.UserID;
         const public_key = row.pw_public_key;
         //technically has potential to be stuck infinitely
@@ -242,7 +292,16 @@ app.post('/create_account', (req, res)=>{
     };
     //device specific keys currently not implemented
     if(is_bad_request(req, attr_mapping)){return res.status(400).end();}
-    db.get('select username from Users where username=?', [req.body['username']], (err, row) => {
+    const username = req.body.username.toLowerCase();
+    let isalphanumeric = true;
+    for(let i = 0; i < username.length; i++){
+        if(!('a'<=username[i] && username[i]<='z') && !('0'<=username[i]&&username[i]<='9')){
+            isalphanumeric = false;
+            break;
+        }
+    }
+    if(!isalphanumeric) return res.send({error:'only alphanumeric characters allowed in username'});
+    db.get('select username from Users where username=?', [username], (err, row) => {
         if(err){console.error(err.message);return res.status(500).end();}
         if(row){return res.send({error:'user already exists'});}
         db.get('select email from Users where email=?', req.body['email'], (err, row)=>{
@@ -259,7 +318,7 @@ app.post('/create_account', (req, res)=>{
                 keygen_salt, server_salt, pw_public_key)
                 values(?,?,?,?,?,?,?)`,[
                 req.body.email,
-                req.body.username,
+                username,
                 hex_pw_hash,
                 req.body.clientSalt,
                 req.body.keygenSalt,
@@ -267,7 +326,7 @@ app.post('/create_account', (req, res)=>{
                 req.body.publicKey], function(err){
                 if(err){console.error(err.message);return res.send(500).end();}
                 let token = generate_auth_token();
-                const expiration = (new Date()).getTime() + token_valid_seconds;
+                const expiration = (new Date()).getTime() + token_valid_ms;
                 const user_id = this.lastID;
                 //technically has potentially to be stuck infinitely
                 //but probability is incredibly low
@@ -296,34 +355,27 @@ app.post('/create_account', (req, res)=>{
 
 //for now assuming that the number of conversations is able to be completely loaded
 //future may implement ajax method of loading more conversations
-app.post('/convo_req', (req, res) =>{
+app.post('/convo_req', async (req, res) =>{
     const attr_mapping = {
         required:{
             'authToken':'string',
         },
         optional:{
             'deviceID':'number'
+            /*,
+            'index_start':'number',
+            'index_end'
+            */
         }
     };
-    if(is_bad_request(attr_mapping)){return res.status(400).end();}
-    db.get('select UserID, expiration from AuthTokens where token=?', [req.body.authToken], function(err, row){
-        if(err){console.error(err.message); return res.status(500).end();}
-        if(!row){return res.send({auth_status:false, error:'auth_token not valid'});}
-        if(row.expiration < (new Date()).getTime()){
-            return res.send({auth_status:false, error:'session has expired'});
-        }
-        const user_id = row.UserID;
-        if(expiration < (new Date()).getTime() + token_valid_seconds - token_refresh_seconds){
-            const new_expiration = (new Date()).getTime() + token_valid_seconds;
-            db.run('update AuthTokens set expiration=? where token=?', [new_expiration, req.body.authToken], (err)=>{
-                if(err){console.error(err.message);}
-            });
-        }
-        let is_device = req.body.hasOwnProperty('deviceID');
-        db.all(`select * from UserConversationMap
+    if(is_bad_request(req, attr_mapping)){return res.status(400).end();}
+    let verification_promise = verify_auth_token(req.body.authToken);
+    const user_id = await verification_promise;
+    let conversations_promise = new Promise((res, rej)=>{
+        db.all(`select Conversations.ConversationID, default_name, custom_name from UserConversationMap
             LEFT JOIN Conversations on Conversations.ConversationID=UserConversationMap.ConversationID
-            where UserID=?`, [req.body.userID], (err, rows)=>{
-                if(err){console.error(err.message); return res.status(500).end();}
+            where UserID=?`, [user_id], async (err, rows)=>{
+                if(err) throw err;
                 let records = rows;
                 const convo_obj_prototype = {
                     id:-1,
@@ -331,35 +383,49 @@ app.post('/convo_req', (req, res) =>{
                     last_msg_digest:'deadd0d0'
                 };
                 let convo_list = [];
-                const record_loop = ()=>{
-                    if(records.length > 0){
-                        let next_record = records.pop();
-                        let next_convo = Object.create(convo_obj_prototype);
-                        next_convo.id = next_record.ConversationID;
-                        next_convo.name = (next_record.custom_name) ? next_record.custom_name : next_record.default_name;
-                        db.get(`select MessageID, senttime, username from Messages
-                            left join Users on Users.UserID=Messages.senderID where ConversationID=?`,
-                            [next_record.ConversationID], (err, row)=>{
-                                if(err){console.error(err.message);record_loop();}
-                                if(!row){console.error('no corresponding message for device');}
-                                db.get(`select contents from digests
-                                    left join Messages ON Messages.MessageID=Digests.MessageID
-                                    where MessageID=? order by senttime desc`, [row.MessageID], (err, row)=>{
-                                        if(err){console.error(err.message);record_loop();}
-                                        if(!row){next_convo.last_msg_digest = '';}
-                                        else{next_convo.last_msg_digest = row.contents;}
-                                        convo_list.unshift(next_convo);
-                                        record_loop();
-                                    });
-                            });
+                for(let i = 0; i < records.length; i++){
+                    let next_convo = Object.create(convo_obj_prototype);
+                    next_convo.id =  records[i].ConversationID;
+                    next_convo.name = (records[i].custom_name) ? records[i].custom_name : records[i].default_name;
+                    let last_digest_promise = new Promise((res, rej)=>{
+                        const select_callback = (row, err)=>{
+                            if(err) throw err;
+                            if(!row) return res('');
+                            res(row.contents);
+                        };
+                        if(req.body.hasOwnProperty('deviceID')){
+                            db.get(`select contents from Digests
+                                left join Messages Messages.MessageID=Digests.MessageID
+                                left join Conversations Conversations.ConversationID=Messages.ConversationID
+                                where DeviceID=? and ConversationID=? order by senttime desc`, [req.body.deviceID, next_convo.id], select_callback)
+                        }
+                        else{
+                            db.get(`select contents from Digests
+                                left join Messages Messages.MessageID=Digests.MessageID
+                                left join Conversations Conversations.ConversationID=Messages.ConversationID
+                                where UserID=? and ConversationID=? order by senttime desc`, [user_id, next_convo.id], select_callback)
+                        };
+                    });
+                    try{
+                        next_convo.last_msg_digest = await last_digest_promise;
                     }
-                    else{
-                        res.send({conversation_objs:convo_list});
+                    catch(err){
+                        throw err;
                     }
-                };
-                record_loop();
+                    convo_list.push(next_convo);
+                }
+                res(convo_list);
         });
     });
+    let conversation_obj_list;
+    try{
+        conversation_obj_list = await conversations_promise;
+    }
+    catch(err){
+        console.error(err.message);
+        return res.status(500).end();
+    }
+    return res.send({conversationObjects:conversation_obj_list});
 });
 
 app.post('/messages_req', (req, res)=>{
@@ -372,7 +438,7 @@ app.post('/messages_req', (req, res)=>{
             'deviceID':'number'
         }
     };
-    if(is_bad_request(attr_mapping)){return res.status(400).end();}
+    if(is_bad_request(req, attr_mapping)){return res.status(400).end();}
     db.get('select UserID, expiration from AuthTokens where token=?', [req.body.authToken], function(err, row){
         if(err){console.error(err.message); return res.status(500).end();}
         if(!row){return res.send({auth_status:false, error:'auth_token not valid'});}
@@ -381,8 +447,8 @@ app.post('/messages_req', (req, res)=>{
         }
         const user_id = row.UserID;
         //refresh token if hasn't been refreshed for an hour
-        if(expiration < (new Date()).getTime() + token_valid_seconds - token_refresh_seconds){
-            const new_expiration = (new Date()).getTime() + token_valid_seconds;
+        if(row.expiration < (new Date()).getTime() + token_valid_ms - token_refresh_ms){
+            const new_expiration = (new Date()).getTime() + token_valid_ms;
             db.run('update AuthTokens set expiration=? where token=?', [new_expiration, req.body.authToken], (err)=>{
                 if(err){console.error(err.message);}
             });
@@ -438,7 +504,7 @@ app.post('/keys_req', (req, res)=>{
         },
         optional:{}
     };
-    if(is_bad_request(attr_mapping)){return res.status(400).end();}
+    if(is_bad_request(req, attr_mapping)){return res.status(400).end();}
     db.get('select UserID, expiration from AuthTokens where token=?', [req.body.authToken], function(err, row){
         if(err){console.error(err.message); return res.status(500).end();}
         if(!row){return res.send({auth_status:false, error:'auth_token not valid'});}
@@ -447,8 +513,8 @@ app.post('/keys_req', (req, res)=>{
         }
         const user_id = row.UserID;
         //refresh token if hasn't been refreshsed for an hour
-        if(expiration < (new Date()).getTime() + token_valid_seconds - token_refresh_seconds){
-            const new_expiration = (new Date()).getTime() + token_valid_seconds;
+        if(row.expiration < (new Date()).getTime() + token_valid_ms - token_refresh_ms){
+            const new_expiration = (new Date()).getTime() + token_valid_ms;
             db.run('update AuthTokens set expiration=? where token=?', [new_expiration, req.body.authToken], (err)=>{
                 if(err){console.error(err.message);}
             });
@@ -473,7 +539,7 @@ app.post('/keys_req', (req, res)=>{
                         new_device_key.key = rows[i].public_key;
                         device_key_list.push(new_device_key);
                     }
-                    db.all(`select UserID, pw_public_key from UserConversationMap
+                    db.all(`select Users.UserID, pw_public_key from UserConversationMap
                         left join Users on Users.UserID=UserConversationMap.UserID
                         where ConversationID=?`, [req.body.conversationID], (err, rows)=>{
                             if(err){console.error(err.message); return res.status(500).end();}
@@ -485,7 +551,7 @@ app.post('/keys_req', (req, res)=>{
                             for(let i = 0; i < rows.length; i++){
                                 const new_user_key = Object.create(user_key_obj_prototype);
                                 new_user_key.id = rows[i].UserID;
-                                new_user_key.key = rwos[i].pw_public_key;
+                                new_user_key.key = rows[i].pw_public_key;
                                 user_key_list.push(new_user_key);
                             }
                             res.send({
@@ -493,13 +559,157 @@ app.post('/keys_req', (req, res)=>{
                                 userKeys:user_key_list
                             });
                         });
-                })
+                });
         });
     });
 });
 
-/*
- * digests object expected in form:
+//possibly add device id verification here
+app.post('/last_msg_req', async function(req, res){
+    const attr_mapping = {
+        required:{
+            'authToken':'string',
+            'conversationID':'number',
+        },
+        optional:{
+            'deviceID':'number'
+        }
+    };
+    if(is_bad_request(req, attr_mapping)) return res.status(400).end();
+    let verification_promise = verify_auth_token(req.body.authToken);
+    const user_id = await verification_promise;
+    let permision_promise = new Promise((res, rej)=>{
+        db.get('select * from UserConversationMap where UserID=? and ConversationID=?',
+            [user_id, req.body.conversationID], (err, row)=>{
+                if(err) throw err;
+                if(!row) return res(false);
+                res(true);
+            });
+    });
+    let is_convo = await permision_promise;
+    if(!is_convo) return res.status(403).end();
+    let last_digest_promise = new Promise((res, rej)=>{
+        const select_callback = (row, err)=>{
+            if(err) throw err;
+            if(!row) return res('');
+            res(row.contents);
+        }
+        if(req.body.hasOwnProperty('deviceID')){
+            db.get(`select contents from Digests
+                left join Messages Messages.MessageID=Digests.MessageID
+                left join Conversations Conversations.ConversationID=Messages.ConversationID
+                where DeviceID=? and ConversationID=? order by senttime desc`, [req.body.deviceID, req.body.conversationID], select_callback);
+        }
+        else{
+            db.get(`select contents from Digests
+                left join Messages Messages.MessageID=Digests.MessageID
+                left join Conversations Conversations.ConversationID=Messages.ConversationID
+                where UserID=? and ConversationID=? order by senttime desc`, [user_id, req.body.conversationID], select_callback);
+        }
+    });
+    let digest;
+    try{
+        digest = await last_digest_promise;
+    }
+    catch(err){
+        console.error(err.message);
+        return res.status(400).end();
+    }
+    res.send({digest:digest});
+})
+
+/*  participants expected in form:
+ *  participants[<username>,...]
+ */
+
+//must rate limit this
+//bug where duplicate user conversation mapping entries can be created
+//if a single user is enterred multiple times
+app.post('/conversation_create', async function(req, res){
+    req_time = new Date();
+    const attr_mapping = {
+        required:{
+            'authToken':'string',
+            'participants':'object'
+        },
+        optional:{
+            'name':'string'
+        }
+    };
+    if(is_bad_request(req, attr_mapping)) return res.status(400).end();
+    let verification_promise = verify_auth_token(req.body.authToken);
+    if(!Array.isArray(req.body.participants)) return res.status(400).end();
+    const users = req.body.participants;
+    for(let i = 0; i < users.length; i++){
+        if(typeof users[i] != 'string') return res.status(400).end();
+    }
+    const user_id = await verification_promise;
+    if(user_id == -1) return res.send({authStatus:false, error:'auth_token not valid'});
+    let user_validation_arr = []
+    for(let i = 0; i < users.length; i++){
+        let promise = new Promise((res, rej)=>{
+            db.get('select UserID from Users where username=?', [users[i]], (err, row)=>{
+                if(err) throw err;
+                if(!row)  return res(-1);
+                res(row.UserID);
+            });
+        });
+        user_validation_arr.push(promise);
+    }
+    let user_ids = []
+    let contains_user = false;
+    for(let i = 0; i < user_validation_arr.length; i++){
+        let id;
+        try{
+            id = await user_validation_arr[i];
+        }
+        catch (err){
+            console.error(err.message);
+            return res.status(500).end();
+        }
+        if (id == -1){
+            return res.send({error:'some users not found'});
+        }
+        if(id == user_id) contains_user = true;
+        user_ids.push(id);
+    }
+    const name = req.body.hasOwnProperty('name') ? req.body.name : req.body.participants.join(' ');
+    if(!contains_user) return res.send({error:'participants did not contain user'});
+    insert_promise = new Promise((res, rej)=>{
+        db.run('insert into Conversations(default_name, time_created) values(?,?)',
+            [name, req_time.getTime()], function(err){
+                if(err) throw err;
+                const convo_id = this.lastID;
+                //investigate how to roll back all inserts if error
+                for(let i = 0; i < user_ids.length; i++){
+                    if(user_id == user_ids[i] && req.body.hasOwnProperty('name')){
+                        db.run('insert into UserConversationMap(UserID, ConversationID, custom_name) values(?,?,?)',
+                            [user_ids[i], convo_id, req.body.name], (err)=>{
+                                if(err) console.error(err);
+                            });
+                    }
+                    else{
+                        db.run('insert into UserConversationMap(UserID, ConversationID) values(?,?)',
+                            [user_ids[i], convo_id], (err)=>{
+                                if(err) console.error(err);
+                            });
+                    }
+                }
+                res(convo_id);
+            });
+    });
+    let convo_id;
+    try{
+        convo_id = await insert_promise;
+    }
+    catch (err){
+        console.error(err.message);
+        return res.status(500).end();
+    }
+    res.send({conversationID:convo_id, name:name});
+});
+
+/*  digests object expected in form:
     {
         userDigests:[{id:<some_id>, digest:<some_digest>}, ...]
         deviceDigests:[{id:<some_id>, digest:<some_digest>}, ...]
@@ -516,7 +726,7 @@ app.post('/message_send', (req, res)=>{
         },
         optional:{}
     };
-    if(is_bad_request(attr_mapping)){return res.status(400).end();}
+    if(is_bad_request(req, attr_mapping)){return res.status(400).end();}
     if(!req.body.digests.hasOwnProperty('userDigests') || !req.body.digests.hasOwnProperty('deviceDigests')){
         return res.status(400).end();
     }
@@ -543,8 +753,8 @@ app.post('/message_send', (req, res)=>{
         }
         const user_id = row.UserID;
         //refresh token if hasn't been refreshsed for an hour
-        if(expiration < (new Date()).getTime() + token_valid_seconds - token_refresh_seconds){
-            const new_expiration = (new Date()).getTime() + token_valid_seconds;
+        if(row.expiration < (new Date()).getTime() + token_valid_ms - token_refresh_ms){
+            const new_expiration = (new Date()).getTime() + token_valid_ms;
             db.run('update AuthTokens set expiration=? where token=?', [new_expiration, req.body.authToken], (err)=>{
                 if(err){console.error(err.message);}
             });

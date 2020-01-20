@@ -1,4 +1,9 @@
 const sqlite3 = require('sqlite3').verbose();
+const fs = require('fs');
+if(fs.existsSync('./db/central.db')){
+    fs.unlinkSync('./db/central.db');
+}
+
 
 let db = new sqlite3.Database('./db/central.db', sqlite3.OPEN_CREATE | sqlite3.OPEN_READWRITE, (err)=>{
     if(err){console.error(err.msg);}
