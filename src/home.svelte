@@ -5,7 +5,6 @@
 
 	const ajax_json_req = (req_obj, path) =>{
 		console.log(path);
-		console.log(req_obj);
 		return new Promise((res, rej)=>{
 			let req = new XMLHttpRequest();
 			req.open("POST", path, true);
@@ -14,7 +13,6 @@
 			req.onreadystatechange = () =>{
 				if(req.readyState != XMLHttpRequest.DONE) return;
 				if(req.status !== 200) rej(new Error('Error ' + req.status.toString()));
-				console.log(req.response);
 				let response_obj = JSON.parse(req.response);
 				if(response_obj.hasOwnProperty('error')) rej(new Error(response_obj.error));
 				res(response_obj);
@@ -59,14 +57,13 @@
 	let messages_ref;
 	let curr_message;
 	let curr_convo_obj;
-	const get_fmtted_time = () =>{
-		const curr_date = new Date();
-		const year = (1900 + curr_date.getYear()).toString();
-		const month = ('0' + (1 + curr_date.getMonth()).toString()).slice(-2);
-		const day = curr_date.getDate().toString();
-		const hours = ('0' + curr_date.getHours().toString()).slice(-2);
-		const minutes = ('0' + curr_date.getMinutes().toString()).slice(-2);
-		const seconds = ('0' + curr_date.getSeconds().toString()).slice(-2);
+	const get_fmtted_time = (date_obj) =>{
+		const year = (1900 + date_obj.getYear()).toString();
+		const month = ('0' + (1 + date_obj.getMonth()).toString()).slice(-2);
+		const day = date_obj.getDate().toString();
+		const hours = ('0' + date_obj.getHours().toString()).slice(-2);
+		const minutes = ('0' + date_obj.getMinutes().toString()).slice(-2);
+		const seconds = ('0' + date_obj.getSeconds().toString()).slice(-2);
 		return year + '-' + month + '-' + day + ' ' + hours + ':' + minutes + ':' + seconds;
 	};
 	const digest_obj_prototype = {
@@ -109,12 +106,8 @@
 			conversation_list.push(new_convo_obj);
 		}
 		conversation_list = conversation_list;
-		console.log(conversation_list);
 	};
 	populate_convos();
-	async function open_convo(){
-
-	}
 
 	/*
 	async function send_msg(){
@@ -136,17 +129,6 @@
 			console
 		}
 	}*/
-	const send_msg = () =>{
-		let new_message = Object.create(message_obj_prototype);
-		new_message.sender=username;
-		new_message.contents=curr_message;
-		new_message.time = get_fmtted_time();
-		new_message.from_you = true;
-		message_list.push(new_message);
-		message_list=message_list;
-		curr_message = '';
-		messages_ref.scrollTop = messages_ref.scrollHeight;
-	};
 
 	let display_add_account = false;
 	const display_add = () =>{
@@ -175,7 +157,6 @@
 			alert(err.message);
 			return;
 		}
-		console.log('here');
 		const convo_id = response_obj.conversationID;
 		const name = response_obj.name;
 		req_obj = {
@@ -217,28 +198,97 @@
 		display_add_account = false;
 	};
 
+	let open_convo_val = -1;
+
+	//race condition here from spam potentially
+	const open_convo = async (id)=>{
+		const req_obj = {
+			authToken:authToken,
+			conversationID:id
+		};
+		let promise = ajax_json_req(req_obj, '/messages_req');
+		let res_obj;
+		try{
+			res_obj = await promise;
+		}
+		catch(err){
+			alert(err.message);
+			return;
+		}
+		message_list = [];
+		let arr = res_obj.messageObjects;
+		for(let i = 0; i < arr.length; i++){
+			let new_message_obj = Object.create(message_obj_prototype);
+			new_message_obj.sender = arr[i].sender;
+			//add decryption here later
+			new_message_obj.contents = arr[i].digest;
+			new_message_obj.time = get_fmtted_time(new Date(arr[i].time));
+			new_message_obj.from_you = username == arr[i].sender;
+			message_list.push(new_message_obj);
+		}
+		message_list = message_list;
+	}
+
+	const convo_change = (index) =>{
+		if(index == -1) return;
+		//update conversation_with new colour
+		conversation_list = conversation_list;
+		open_convo(conversation_list[index].id);
+	}
+	$: convo_change(open_convo_val);
+
+	const req_send_msg = async(convo_obj, msg) =>{
+		const req_obj = {
+			authToken:authToken,
+			conversationID:convo_obj.id,
+			digests:{
+				userDigests:[],
+				deviceDigests:[]
+			}
+		};
+		console.log(convo_obj);
+		for(let i = 0; i < convo_obj.keys.userKeys.length; i++){
+			req_obj.digests.userDigests.push({
+				id:convo_obj.keys.userKeys[i].id,
+				//add encryption here later
+				digest:msg
+			});
+		}
+		for(let i = 0; i < convo_obj.keys.deviceKeys.length; i++){
+			req_obj.digests.deviceDigests.push({
+				id:convo_obj.keys.deviceKeys[i].id,
+				//add encryption here later
+				digest:msg
+			});
+		}
+		let promise = ajax_json_req(req_obj, '/msg_create');
+		let res_obj;
+		try{
+			res_obj = await promise;
+		}
+		catch(err){
+			alert(err.message);
+			return;
+		}
+	};
+
+	const send_msg = () =>{
+		let convo_obj = conversation_list[open_convo_val];
+		let new_message = Object.create(message_obj_prototype);
+		req_send_msg(convo_obj, curr_message);
+		new_message.sender=username;
+		new_message.contents=curr_message;
+		new_message.time = get_fmtted_time(new Date());
+		new_message.from_you = true;
+		message_list.push(new_message);
+		message_list=message_list;
+		curr_message = '';
+		messages_ref.scrollTop = messages_ref.scrollHeight;
+	};
+
+
 	//dummy values
-	let foo = Object.create(conversation_obj_prototype);
-	foo.id = 0;
-	foo.name = 'a better convo name';
-	foo.last_msg = 'a cool message';
-	conversation_list.push(foo);
-	foo = Object.create(conversation_obj_prototype);
-	foo.id = 1;
-	foo.name = 'wayy better';
-	foo.last_msg = 'a cooler message';
-	conversation_list.push(foo);
-	foo = Object.create(conversation_obj_prototype);
-	foo.id = 1;
-	foo.name = 'convo 3';
-	foo.last_msg = 'message goes here';
-	conversation_list.push(foo);
-	foo = Object.create(conversation_obj_prototype);
-	foo.id = 1;
-	foo.name = 'convo 4';
-	foo.last_msg = 'giberish';
-	conversation_list.push(foo);
-	foo = Object.create(message_obj_prototype);
+	let foo = Object.create(message_obj_prototype);
 	foo.sender='seamooo';
 	foo.contents='wow awesome message you got there';
 	foo.time='1997-03-11 11:20:24';
@@ -264,6 +314,8 @@
 	message_list.push(foo);
 	conversation_list = conversation_list;
 	message_list = message_list;
+
+
 </script>
 
 <style>
@@ -394,6 +446,12 @@
 		width:100%;
 		font-size:30px;
 	}
+	.convo_radio_wrapper{
+		appearance:none;
+		-webkit-appearance: none;
+  		-moz-appearance: none;
+  		position:fixed;
+	}
 </style>
 
 
@@ -412,12 +470,15 @@
 		</div>
 		<div class="conversation_wrapper">
 			{#each conversation_list as conversation, index}
-			<div class="convo_box" style={(index % 2 == 0) ? "background-color:#ddd" : ""}>
+			<label>
+			<div class="convo_box" style={(index == open_convo_val) ? "background-color:#cef" : (index % 2 == 0) ? "background-color:#ddd" : ""}>
+				<input type=radio class="convo_radio_wrapper" bind:group={open_convo_val} value={index}>
 				<ul style="list-style-type:none;">
 					<li class="header">{conversation.name}</li>
 					<li class="msg">{conversation.last_msg}</li>
 				</ul>
 			</div>
+			</label>
 			{/each}
 		</div>
 	</div>

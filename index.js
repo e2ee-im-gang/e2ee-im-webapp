@@ -371,6 +371,7 @@ app.post('/convo_req', async (req, res) =>{
     if(is_bad_request(req, attr_mapping)){return res.status(400).end();}
     let verification_promise = verify_auth_token(req.body.authToken);
     const user_id = await verification_promise;
+    if(user_id == -1) return res.status(403).end();
     let conversations_promise = new Promise((res, rej)=>{
         db.all(`select Conversations.ConversationID, default_name, custom_name from UserConversationMap
             LEFT JOIN Conversations on Conversations.ConversationID=UserConversationMap.ConversationID
@@ -388,22 +389,22 @@ app.post('/convo_req', async (req, res) =>{
                     next_convo.id =  records[i].ConversationID;
                     next_convo.name = (records[i].custom_name) ? records[i].custom_name : records[i].default_name;
                     let last_digest_promise = new Promise((res, rej)=>{
-                        const select_callback = (row, err)=>{
+                        const select_callback = (err, row)=>{
                             if(err) throw err;
                             if(!row) return res('');
                             res(row.contents);
                         };
                         if(req.body.hasOwnProperty('deviceID')){
                             db.get(`select contents from Digests
-                                left join Messages Messages.MessageID=Digests.MessageID
-                                left join Conversations Conversations.ConversationID=Messages.ConversationID
-                                where DeviceID=? and ConversationID=? order by senttime desc`, [req.body.deviceID, next_convo.id], select_callback)
+                                left join Messages on Messages.MessageID=Digests.MessageID
+                                left join on Conversations Conversations.ConversationID=Messages.ConversationID
+                                where DeviceID=? and Conversations.ConversationID=? order by senttime desc`, [req.body.deviceID, next_convo.id], select_callback)
                         }
                         else{
                             db.get(`select contents from Digests
-                                left join Messages Messages.MessageID=Digests.MessageID
-                                left join Conversations Conversations.ConversationID=Messages.ConversationID
-                                where UserID=? and ConversationID=? order by senttime desc`, [user_id, next_convo.id], select_callback)
+                                left join Messages on Messages.MessageID=Digests.MessageID
+                                left join Conversations on Conversations.ConversationID=Messages.ConversationID
+                                where UserID=? and Conversations.ConversationID=? order by senttime desc`, [user_id, next_convo.id], select_callback)
                         };
                     });
                     try{
@@ -472,7 +473,7 @@ app.post('/messages_req', (req, res)=>{
                     next_msg.digest = rows[i].contents;
                     next_msg.time = rows[i].senttime;
                 }
-                res.send({message_objs:message_list});
+                res.send({messageObjects:message_list});
             }
             if(req.body.hasOwnProperty('deviceID')){
                 //can get other users digests for the same conversation
@@ -489,7 +490,7 @@ app.post('/messages_req', (req, res)=>{
                 db.all(`select contents, senttime, username from Digests
                     left join Messages on Messages.MessageID=Digests.MessageID
                     left join Users on Users.UserID=Digests.UserID
-                    where ConversationID=? and UserID=?
+                    where ConversationID=? and Users.UserID=?
                     order by senttime desc`, [req.body.conversationID, user_id], digests_callback);
             }
         });
@@ -578,6 +579,7 @@ app.post('/last_msg_req', async function(req, res){
     if(is_bad_request(req, attr_mapping)) return res.status(400).end();
     let verification_promise = verify_auth_token(req.body.authToken);
     const user_id = await verification_promise;
+    if(user_id == -1) return res.status(403).end();
     let permision_promise = new Promise((res, rej)=>{
         db.get('select * from UserConversationMap where UserID=? and ConversationID=?',
             [user_id, req.body.conversationID], (err, row)=>{
@@ -589,21 +591,21 @@ app.post('/last_msg_req', async function(req, res){
     let is_convo = await permision_promise;
     if(!is_convo) return res.status(403).end();
     let last_digest_promise = new Promise((res, rej)=>{
-        const select_callback = (row, err)=>{
+        const select_callback = (err, row)=>{
             if(err) throw err;
             if(!row) return res('');
             res(row.contents);
         }
         if(req.body.hasOwnProperty('deviceID')){
             db.get(`select contents from Digests
-                left join Messages Messages.MessageID=Digests.MessageID
-                left join Conversations Conversations.ConversationID=Messages.ConversationID
-                where DeviceID=? and ConversationID=? order by senttime desc`, [req.body.deviceID, req.body.conversationID], select_callback);
+                left join Messages on Messages.MessageID=Digests.MessageID
+                left join Conversations on Conversations.ConversationID=Messages.ConversationID
+                where DeviceID=? and Conversations.ConversationID=? order by senttime desc`, [req.body.deviceID, req.body.conversationID], select_callback);
         }
         else{
             db.get(`select contents from Digests
-                left join Messages Messages.MessageID=Digests.MessageID
-                left join Conversations Conversations.ConversationID=Messages.ConversationID
+                left join Messages on Messages.MessageID=Digests.MessageID
+                left join Conversations on Conversations.ConversationID=Messages.ConversationID
                 where UserID=? and ConversationID=? order by senttime desc`, [user_id, req.body.conversationID], select_callback);
         }
     });
@@ -642,8 +644,7 @@ app.post('/conversation_create', async function(req, res){
     const users = req.body.participants;
     for(let i = 0; i < users.length; i++){
         if(typeof users[i] != 'string') return res.status(400).end();
-    }
-    const user_id = await verification_promise;
+    }    const user_id = await verification_promise;
     if(user_id == -1) return res.send({authStatus:false, error:'auth_token not valid'});
     let user_validation_arr = []
     for(let i = 0; i < users.length; i++){
@@ -716,7 +717,7 @@ app.post('/conversation_create', async function(req, res){
     }
  */
 
-app.post('/message_send', (req, res)=>{
+app.post('/msg_create', async (req, res)=>{
     const req_time = new Date();
     const attr_mapping = {
         required:{
@@ -730,7 +731,7 @@ app.post('/message_send', (req, res)=>{
     if(!req.body.digests.hasOwnProperty('userDigests') || !req.body.digests.hasOwnProperty('deviceDigests')){
         return res.status(400).end();
     }
-    if(typeof req.body.digests.userDigests != 'list' || typeof req.body.digests.deviceDigests != 'list'){
+    if(!Array.isArray(req.body.digests.userDigests) || !Array.isArray(req.body.digests.deviceDigests)){
         return res.status(400).end();
     }
     const user_digests = req.body.digests.userDigests;
@@ -740,80 +741,159 @@ app.post('/message_send', (req, res)=>{
         if(!user_digests[i].hasOwnProperty('id') || !user_digests[i].hasOwnProperty('digest')){
             return res.status(400).end();
         }
-        if(typeof user_digests[i].id != 'string' || typeof user_digests[i].digest != 'string'){
+        if(typeof user_digests[i].id != 'number' || typeof user_digests[i].digest != 'string'){
+            return res.status(400).end();
+        }
+    }
+    for(let i = 0; i < device_digests.length; i++){
+        if(typeof device_digests[i] != 'object'){return res.status(400).end();}
+        if(!device_digests[i].hasOwnProperty('id') || !device_digests[i].hasOwnProperty('digest')){
+            return res.status(400).end();
+        }
+        if(typeof device_digests[i].id != 'number' || typeof device_digests[i].digest != 'string'){
             return res.status(400).end();
         }
     }
     //finished typechecking json
-    db.get('select UserID, expiration from AuthTokens where token=?', [req.body.authToken], function(err, row){
-        if(err){console.error(err.message); return res.status(500).end();}
-        if(!row){return res.send({auth_status:false, error:'auth_token not valid'});}
-        if(row.expiration < (new Date()).getTime()){
-            return res.send({auth_status:false, error:'session has expired'});
-        }
-        const user_id = row.UserID;
-        //refresh token if hasn't been refreshsed for an hour
-        if(row.expiration < (new Date()).getTime() + token_valid_ms - token_refresh_ms){
-            const new_expiration = (new Date()).getTime() + token_valid_ms;
-            db.run('update AuthTokens set expiration=? where token=?', [new_expiration, req.body.authToken], (err)=>{
-                if(err){console.error(err.message);}
-            });
-        }
+    let verification_promise = verify_auth_token(req.body.authToken);
+    const user_id = await verification_promise;
+    if(user_id == -1) return res.status(403).end();
+    let permission_promise = new Promise((res, rej)=>{
         db.get('select * from UserConversationMap where UserID=? and ConversationID=?', [user_id, req.body.conversationID], (err, row)=>{
-            if(err){console.error(err.message); return res.status(500).end();}
-            //accessing illegal conversationid
-            //technically could be 403 or 404 but no need to give unneccessary information
-            if(!row){return res.status(403).end();}
-            db.all('select UserID from UserConversationMap where ConversationID=?', [req.body.conversationID], (err, rows)=>{
-                if(user_digests.length < rows.length){return res.send({error:'missing digests, refresh to send messages to new members'});}
-                let req_user_ids = {};
-                for(let i = 0; i < rows.length; i++){
-                    req_user_ids[rows.UserID] = null;
-                }
-                for(let i = 0; i < user_digests.length; i++){
-                    if(!req_user_ids.hasOwnProperty(user_digests[i].id)){
-                        return res.status(400).end();
-                    }
-                }
-                db.all(`select DeviceID from Devices
-                    left join UserConversationMap UserConversationMap.UserID=Devices.UserID
-                    where ConversationID=?`, [req.body.conversationID], (err, rows)=>{
-                        if(device_digests.length != rows.length){return res.send({error:'missing digests, refresh to send messages to new members'});}
-                        let req_device_ids = {};
-                        for(let i  = 0; i < rows.length; i++){
-                            req_device_ids[rows.DeviceID] = null;
-                        }
-                        for(let i = 0; i < device_digests.length; i++){
-                            if(!device_user_ids.hasOwnProperty(device_digests[i].id)){
-                                return res.status(400).end();
-                            }
-                        }
-                        //at this point request is confirmed to be appropriate
-                        //possibly look into how to revert inserts in case of errors with database inserts
-                        db.run('insert into Messages(SenderID, ConversationID, senttime) values(?,?,?)',[user_id, req.body.ConversationID, req_time.getTime()], function(err){
-                            if(err){console.error(err.message);return res.status(500).end();}
-                            const message_id = this.lastID;
-                            for(let i = 0; i < device_digests.length; i++){
-                                //technically can insert junk digest but no way for server to verify that it isn't junk
-                                //without knowing too much information
-                                db.run('insert into Digests(contents, MessageID, UserID) values(?,?,?)',
-                                    [device_digests[i].digest, message_id, device_digests[i].id], (err)=>{
-                                        if(err){console.error(err.message);}
-                                    });
-                            }
-                            for(let i = 0; i < user_digests.length; i++){
-                                db.run('insert into Digests(contents, MessageID, DeviceID) values(?,?,?)',
-                                    [device_digests[i].digest, message_id, device_digests[i].id], (err)=>{
-                                        if(err){console.error(err.message);}
-                                    });
-                            }
-                            //sending status not useful but do not want to send empty object
-                            res.send({status:'success'});
-                        });
-                    });
-            });
+            if(err) throw err;
+            if(!row) return res(false);
+            res(true);
         });
     });
+    let has_permissions;
+    try{
+        has_permissions = await permission_promise;
+    }
+    catch(err){
+        console.error(err);
+        return;
+    }
+    //accessing illegal conversationid
+    //technically could be 403 or 404 but no need to give unneccessary information
+    if(!has_permissions) return res.status(403).end();
+    let user_id_promise = new Promise((res, rej)=>{
+        db.all('select UserID from UserConversationMap where ConversationID=?', [req.body.conversationID], (err, rows)=>{
+            if(err) throw err;
+            let rv = [];
+            for(let i = 0; i < rows.length; i++){
+                rv.push(rows[i].UserID);
+            }
+            res(rv);
+        });
+    });
+    let device_id_promise = new Promise((res, rej)=>{
+        db.all(`select DeviceID from Devices
+            left join UserConversationMap on UserConversationMap.UserID=Devices.UserID
+            where ConversationID=?`, [req.body.conversationID], (err, rows)=>{
+                if(err) throw err;
+                let rv = [];
+                for(let i = 0; i < rows.length; i++){
+                    rv.push(rows[i].DeviceID);
+                }
+                res(rv);
+            });
+    });
+    let user_ids;
+    let device_ids;
+    try{
+        user_ids = await user_id_promise;
+        device_ids = await device_id_promise;
+    }
+    catch(err){
+        console.error(err.message);
+        return res.status(500).end();
+    }
+    const req_udigs = req.body.digests.userDigests;
+    const req_ddigs = req.body.digests.deviceDigests;
+    if(user_ids.length != req_udigs.length || device_ids.length != req_ddigs.length){
+        return res.send({error:'missing digests, refresh to send messages to new members'});
+    }
+    let test_set = {};
+    for(let i = 0; i < user_ids.length; i++){
+        test_set[user_ids[i]] = null;
+    }
+    let found_all = true;
+    for(let i = 0; i < req_udigs.length; i++){
+        if(!test_set.hasOwnProperty(req_udigs[i].id)){
+            found_all = false;
+            break;
+        }
+    }
+    if(!found_all) return res.status(400).end();
+    test_set = {};
+    for(let i = 0; i < device_ids.length; i++){
+        test_set[device_ids[i]] = null;
+    }
+    for(let i = 0; i < req_ddigs.length; i++){
+        if(!test_set.hasOwnProperty(req_ddigs[i].id)){
+            found_all = false;
+            break;
+        }
+    }
+    if(!found_all) return res.status(400).end();
+    //request has all correct ids, may insert digests now
+    //possibly look into how to revert inserts in case of errors with database inserts
+    let message_promise = new Promise((res, rej)=>{
+        db.run('insert into Messages(SenderID, ConversationID, senttime) values(?,?,?)',
+            [user_id, req.body.conversationID, req_time.getTime()], function(err){
+                if(err) throw err;
+                res(this.lastID);
+            });
+    });
+    let message_id;
+    try{
+        message_id = await message_promise;
+    }
+    catch(err){
+        console.error(err.message);
+        return res.status(500).end();
+    }
+    let digests_promise = new Promise(async (res, rej)=>{
+        let promises = [];
+        for(let i = 0; i < req_udigs.length; i++){
+            promises.push(new Promise((res, rej)=>{
+                db.run('insert into Digests(contents, MessageID, UserID) values(?,?,?)',
+                    [req_udigs[i].digest, message_id, req_udigs[i].id], function(err){
+                        if(err) throw err;
+                        //value unused for now but could be used for revert on error
+                        res(this.lastID);
+                    });
+            }));
+        }
+        for(let i = 0; i < req_ddigs.length; i++){
+            promises.push(new Promise((res, rej)=>{
+                db.run('insert into Digests(contents, MessageID, DeviceID) values(?,?,?)',
+                    [req_ddigs[i].digest, message_id, req_ddigs[i].id], function(err){
+                        if(err) throw err;
+                        //value unused for now but could be used for revert on error
+                        res(this.lastID);
+                    });
+            }));
+        }
+        for(let i = 0; i < promises.length; i++){
+            try{
+                let digest_id = await promises[i];
+            }
+            catch(err){
+                throw err;
+            }
+        }
+        res({status:'success'});
+    });
+    let res_obj;
+    try{
+        res_obj = await digests_promise;
+    }
+    catch(err){
+        console.error(err.message);
+        res.status(500).end();
+    }
+    res.send(res_obj);
 });
 
 http.listen(3000, (err)=>{
