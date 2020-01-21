@@ -429,7 +429,7 @@ app.post('/convo_req', async (req, res) =>{
     return res.send({conversationObjects:conversation_obj_list});
 });
 
-app.post('/messages_req', (req, res)=>{
+app.post('/messages_req', async (req, res)=>{
     const attr_mapping = {
         required:{
             'authToken':'string',
@@ -440,61 +440,74 @@ app.post('/messages_req', (req, res)=>{
         }
     };
     if(is_bad_request(req, attr_mapping)){return res.status(400).end();}
-    db.get('select UserID, expiration from AuthTokens where token=?', [req.body.authToken], function(err, row){
-        if(err){console.error(err.message); return res.status(500).end();}
-        if(!row){return res.send({auth_status:false, error:'auth_token not valid'});}
-        if(row.expiration < (new Date()).getTime()){
-            return res.send({auth_status:false, error:'session has expired'});
-        }
-        const user_id = row.UserID;
-        //refresh token if hasn't been refreshed for an hour
-        if(row.expiration < (new Date()).getTime() + token_valid_ms - token_refresh_ms){
-            const new_expiration = (new Date()).getTime() + token_valid_ms;
-            db.run('update AuthTokens set expiration=? where token=?', [new_expiration, req.body.authToken], (err)=>{
-                if(err){console.error(err.message);}
-            });
-        }
-        db.get('select * from UserConversationMap where UserID=? and ConversationID=?', [user_id, req.body.conversationID], (err, row)=>{
-            if(err){console.error(err.message); return res.status(500).end();}
-            //accessing illegal conversationid
-            //technically could be 403 or 404 but no need to give unneccessary information
-            if(!row){return res.status(403).end();}
-            const digests_callback = (err, rows) =>{
-                //imperitave that messages are ordered correctly in the message list
-                let message_list = [];
-                const message_obj_prototype = {
-                    sender:'username',
-                    digest:'deadd0d0',
-                    time:0
-                }
-                for(let i = 0; i < rows.length; i++){
-                    let next_msg = Object.create(message_obj_prototype);
-                    next_msg.sender = rows[i].username;
-                    next_msg.digest = rows[i].contents;
-                    next_msg.time = rows[i].senttime;
-                }
-                res.send({messageObjects:message_list});
-            }
-            if(req.body.hasOwnProperty('deviceID')){
-                //can get other users digests for the same conversation
-                //shouldn't be a security flaw as you can already calculate that with their
-                //public keys and your decrypted digests
-                //also digests aren't very useful
-                db.all(`select contents, senttime, username from Digests
-                    left join Messages on Messages.MessageID=Digests.MessageID
-                    left join Users on Users.UserID=Messages.SenderID
-                    where ConversationID=? and DeviceID=?
-                    order by senttime desc`, [req.body.conversationID, req.body.DeviceID], digests_callback);
-            }
-            else{
-                db.all(`select contents, senttime, username from Digests
-                    left join Messages on Messages.MessageID=Digests.MessageID
-                    left join Users on Users.UserID=Digests.UserID
-                    where ConversationID=? and Users.UserID=?
-                    order by senttime desc`, [req.body.conversationID, user_id], digests_callback);
-            }
+    let verification_promise = verify_auth_token(req.body.authToken);
+    const user_id = await verification_promise;
+    if(user_id == -1) return res.status(403).end();
+    let permission_promise = new Promise((res, rej)=>{
+        db.get('select UserID from UserConversationMap where UserID=? and ConversationID=?', [user_id, req.body.conversationID], (err, row)=>{
+            if(err) throw err;
+            if(!row) return res(false);
+            res(true);
         });
     });
+    let has_permissions;
+    try{
+        has_permissions = await permission_promise;
+    }
+    catch(err){
+        console.error(err.message);
+        return res.status(500).end();
+    }
+    //accessing illegal conversationid
+    //technically could be 403 or 404 but no need to give unneccessary information
+    if(!has_permissions) return res.status(403).end();
+    let messages_promise = new Promise((res, rej)=>{
+        const digests_callback = (err, rows)=>{
+            if(err) throw err;
+            //imperitave that messages are ordered correctly in the message list
+            let message_list = [];
+            const message_obj_prototype = {
+                sender:'username',
+                digest:'deadd0d0',
+                time:0
+            }
+            for(let i = 0; i < rows.length; i++){
+                let next_msg = Object.create(message_obj_prototype);
+                next_msg.sender = rows[i].username;
+                next_msg.digest = rows[i].contents;
+                next_msg.time = rows[i].senttime;
+                message_list.push(next_msg);
+            }
+            res(message_list);
+        };
+        if(req.body.hasOwnProperty('deviceID')){
+            //can get other users digests for the same conversation
+            //shouldn't be a security flaw as you can already calculate that with their
+            //public keys and your decrypted digests
+            //also digests aren't very useful without keys
+            db.all(`select contents, senttime, username from Digests
+                left join Messages on Messages.MessageID=Digests.MessageID
+                left join Users on Users.UserID=Messages.SenderID
+                where ConversationID=? and DeviceID=?
+                order by senttime asc`, [req.body.conversationID, req.body.deviceID], digests_callback);
+        }
+        else{
+            db.all(`select contents, senttime, username from Digests
+                left join Messages on Messages.MessageID=Digests.MessageID
+                left join Users on Users.UserID=Messages.SenderID
+                where ConversationID=? and Digests.UserID=?
+                order by senttime asc`, [req.body.conversationID, user_id], digests_callback);
+        }
+    });
+    let message_objs;
+    try{
+        message_objs = await messages_promise;
+    }
+    catch(err){
+        console.error(err.message);
+        return res.status(500).end();
+    }
+    res.send({messageObjects:message_objs});
 });
 
 app.post('/keys_req', (req, res)=>{
@@ -570,7 +583,7 @@ app.post('/last_msg_req', async function(req, res){
     const attr_mapping = {
         required:{
             'authToken':'string',
-            'conversationID':'number',
+            'conversationID':'number'
         },
         optional:{
             'deviceID':'number'

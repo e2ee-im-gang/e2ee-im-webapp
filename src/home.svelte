@@ -109,27 +109,6 @@
 	};
 	populate_convos();
 
-	/*
-	async function send_msg(){
-		let digests = []
-		promise = new Promise((res, rej)=>{
-			let message_send = new XMLHttpRequest();
-			message_send.open('POST', '/message_send', true);
-			message_send.setRequestHeader("Content-Type", "application/json");
-			message_send.send(JSON.stringify({
-				authToken:localStorage.getItem('authToken', response_obj),
-				conversationID:curr_convo_obj.id,
-			}));
-		});
-		let message_res;
-		try{
-			message_res = await promise;
-		}
-		catch (err){
-			console
-		}
-	}*/
-
 	let display_add_account = false;
 	const display_add = () =>{
 		display_add_account = true;
@@ -223,7 +202,7 @@
 			//add decryption here later
 			new_message_obj.contents = arr[i].digest;
 			new_message_obj.time = get_fmtted_time(new Date(arr[i].time));
-			new_message_obj.from_you = username == arr[i].sender;
+			new_message_obj.from_you = username === arr[i].sender;
 			message_list.push(new_message_obj);
 		}
 		message_list = message_list;
@@ -246,7 +225,6 @@
 				deviceDigests:[]
 			}
 		};
-		console.log(convo_obj);
 		for(let i = 0; i < convo_obj.keys.userKeys.length; i++){
 			req_obj.digests.userDigests.push({
 				id:convo_obj.keys.userKeys[i].id,
@@ -274,6 +252,8 @@
 
 	const send_msg = () =>{
 		let convo_obj = conversation_list[open_convo_val];
+		console.log(curr_message)
+		if(curr_message.length == 0 || !curr_message) return;
 		let new_message = Object.create(message_obj_prototype);
 		req_send_msg(convo_obj, curr_message);
 		new_message.sender=username;
@@ -404,15 +384,16 @@
 		height:60px;
 		white-space: nowrap;
 		overflow: hidden;
-		text-overflow: ellipsis;
 		background-color:#aaa;
 	}
 	.convo_box .header{
 		font-size:16px;
 		font-weight: bold;
+		text-overflow: ellipsis;
 	}
 	.convo_box .msg{
 		font-size:13px;
+		text-overflow: ellipsis;
 	}
 	.convo_box .alternate{
 		background-color:#ddd;
