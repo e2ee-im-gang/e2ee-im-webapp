@@ -1,8 +1,8 @@
 <script>
+	import io_wrapper from './socket.io.js';
 	const authToken = localStorage.getItem('authToken');
 	const publicKey = localStorage.getItem('publicKey');
 	const privateKey = localStorage.getItem('privateKey');
-
 	const ajax_json_req = (req_obj, path) =>{
 		console.log(path);
 		return new Promise((res, rej)=>{
@@ -40,6 +40,7 @@
 		get_username();
 	}
 	let conversation_list = [];
+	let conversation_refs = {};
 	const conversation_obj_prototype = {
 		id:-1,
 		name:'default_name',
@@ -103,6 +104,7 @@
 				continue;
 			}
 			new_convo_obj.keys = keys_obj;
+			conversation_refs[new_convo_obj.id] = new_convo_obj;
 			conversation_list.push(new_convo_obj);
 		}
 		conversation_list = conversation_list;
@@ -171,13 +173,25 @@
 		new_convo_obj.name = name;
 		new_convo_obj.last_msg = digest;
 		new_convo_obj.keys = keys;
-		conversation_list.unshift(new_convo_obj);
+		conversation_list.push(new_convo_obj);
 		//updating because svelte
 		conversation_list = conversation_list;
 		display_add_account = false;
 	};
 
 	let open_convo_val = -1;
+
+	//function expects res to be response from
+	//server providing a message object
+	const create_message_obj = (res)=>{
+		let rv = Object.create(message_obj_prototype);
+		rv.sender = res.sender;
+		//add decryption here later
+		rv.contents = res.digest;
+		rv.time = get_fmtted_time(new Date(res.time));
+		rv.from_you = username === res.sender;
+		return rv;
+	};
 
 	//race condition here from spam potentially
 	const open_convo = async (id)=>{
@@ -197,20 +211,16 @@
 		message_list = [];
 		let arr = res_obj.messageObjects;
 		for(let i = 0; i < arr.length; i++){
-			let new_message_obj = Object.create(message_obj_prototype);
-			new_message_obj.sender = arr[i].sender;
-			//add decryption here later
-			new_message_obj.contents = arr[i].digest;
-			new_message_obj.time = get_fmtted_time(new Date(arr[i].time));
-			new_message_obj.from_you = username === arr[i].sender;
+			let new_message_obj = create_message_obj(arr[i]);
 			message_list.push(new_message_obj);
 		}
 		message_list = message_list;
+		messages_ref.scrollTop = messages_ref.scrollHeight;
 	}
 
 	const convo_change = (index) =>{
 		if(index == -1) return;
-		//update conversation_with new colour
+		//update conversation with new colour
 		conversation_list = conversation_list;
 		open_convo(conversation_list[index].id);
 	}
@@ -251,50 +261,61 @@
 	};
 
 	const send_msg = () =>{
+		if(open_convo_val == -1) return;
 		let convo_obj = conversation_list[open_convo_val];
-		console.log(curr_message)
 		if(curr_message.length == 0 || !curr_message) return;
 		let new_message = Object.create(message_obj_prototype);
 		req_send_msg(convo_obj, curr_message);
-		new_message.sender=username;
-		new_message.contents=curr_message;
-		new_message.time = get_fmtted_time(new Date());
-		new_message.from_you = true;
-		message_list.push(new_message);
-		message_list=message_list;
 		curr_message = '';
-		messages_ref.scrollTop = messages_ref.scrollHeight;
 	};
 
-
-	//dummy values
-	let foo = Object.create(message_obj_prototype);
-	foo.sender='seamooo';
-	foo.contents='wow awesome message you got there';
-	foo.time='1997-03-11 11:20:24';
-	foo.from_you=true;
-	message_list.push(foo);
-	foo = Object.create(message_obj_prototype);
-	foo.sender='other';
-	foo.contents='average message';
-	foo.time='1997-03-11 11:20:30';
-	foo.from_you=false;
-	message_list.push(foo);
-	foo = Object.create(message_obj_prototype);
-	foo.sender='seamooo';
-	foo.contents='ehh it was kinda cool I guess';
-	foo.time='1997-03-11 11:20:40';
-	foo.from_you=true;
-	message_list.push(foo);
-	foo = Object.create(message_obj_prototype);
-	foo.sender='other';
-	foo.contents='yeah whatever';
-	foo.time='1997-03-11 11:20:50';
-	foo.from_you=false;
-	message_list.push(foo);
-	conversation_list = conversation_list;
-	message_list = message_list;
-
+	//socket handling begin
+	const socket = io_wrapper.io('/');
+	socket.on('auth_req', ()=>{
+		socket.emit('auth_res', authToken);
+	});
+	socket.on('auth_status', (status)=>{
+		if(status!=='accepted'){
+			console.error('socket responded with status: ', status);
+			socket.close();
+		}
+	})
+	socket.on('new_message', (convo_id, message_obj)=>{
+		let msg_obj = create_message_obj(message_obj);
+		if(conversation_list[open_convo_val].id == convo_id){
+			message_list.push(msg_obj);
+			message_list = message_list;
+			messages_ref.scrollTop = messages_ref.scrollHeight;
+		}
+		//possible race condition with conversation creating at the
+		//same time as the first message is sent
+		//add decryption here eventually
+		conversation_refs[convo_id].last_msg = msg_obj.contents;
+		conversation_list = conversation_list;
+	});
+	socket.on('new_convo', async (convo_obj)=>{
+		const new_convo_obj = Object.create(conversation_obj_prototype);
+		new_convo_obj.id = convo_obj.conversationID;
+		new_convo_obj.name = convo_obj.name;
+		const req_obj = {
+			authToken:authToken,
+			conversationID:new_convo_obj.id
+		};
+		let promise = ajax_json_req(req_obj, '/keys_req');
+		let keys_obj;
+		try{
+			keys_obj = await promise;
+		}
+		catch(err){
+			return console.error(err.message);
+		}
+		new_convo_obj.keys = keys_obj;
+		new_convo_obj.last_msg = '';
+		conversation_refs[new_convo_obj.id] = new_convo_obj;
+		conversation_list.push(new_convo_obj);
+		conversation_list = conversation_list;
+	});
+	//socket handling end
 
 </script>
 
@@ -452,7 +473,7 @@
 		<div class="conversation_wrapper">
 			{#each conversation_list as conversation, index}
 			<label>
-			<div class="convo_box" style={(index == open_convo_val) ? "background-color:#cef" : (index % 2 == 0) ? "background-color:#ddd" : ""}>
+			<div class="convo_box" style={(index == open_convo_val) ? "background-color:#bde" : (index % 2 == 0) ? "background-color:#ddd" : ""}>
 				<input type=radio class="convo_radio_wrapper" bind:group={open_convo_val} value={index}>
 				<ul style="list-style-type:none;">
 					<li class="header">{conversation.name}</li>

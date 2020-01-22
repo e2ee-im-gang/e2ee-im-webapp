@@ -1,6 +1,7 @@
 const express = require('express');
 const app = express();
 const http = require('http').createServer(app);
+const io = require('socket.io')(http);
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const SHA3 = require('sha3').SHA3;
@@ -78,6 +79,35 @@ async function verify_auth_token(token){
     });
     return rv_promise;
 }
+
+let user_socket_map = {};
+let socket_user_map = {};
+
+io.on('connection', function(socket){
+	socket.emit('auth_req');
+	socket.on('auth_res', async (token, device_id)=>{
+		let verification_promise = verify_auth_token(token);
+		let user_id = await verification_promise;
+		if(user_id == -1){
+			socket.emit('auth_status', 'rejected');
+			return socket.disconnect(true);
+		}
+		//race condition here losing ~1 socket if simultaneous requests from same user
+		//uncertain how to fix
+		if(!user_socket_map.hasOwnProperty(user_id)){
+			user_socket_map[user_id] = {};
+		}
+		user_socket_map[user_id][socket.id] = {socket:socket};
+		if(device_id) user_socket_map[user_id][socket.id].device_id = device_id;
+		socket_user_map[socket.id] = user_id;
+	});
+	socket.on('disconnect', ()=>{
+		const user_id = socket_user_map[socket.id];
+		delete socket_user_map[socket.id];
+		delete user_socket_map[user_id][socket.id];
+	});
+});
+
 
 /*  Parameters:
         req: request object from post request
@@ -619,7 +649,7 @@ app.post('/last_msg_req', async function(req, res){
             db.get(`select contents from Digests
                 left join Messages on Messages.MessageID=Digests.MessageID
                 left join Conversations on Conversations.ConversationID=Messages.ConversationID
-                where UserID=? and ConversationID=? order by senttime desc`, [user_id, req.body.conversationID], select_callback);
+                where UserID=? and Conversations.ConversationID=? order by senttime desc`, [user_id, req.body.conversationID], select_callback);
         }
     });
     let digest;
@@ -720,7 +750,20 @@ app.post('/conversation_create', async function(req, res){
         console.error(err.message);
         return res.status(500).end();
     }
-    res.send({conversationID:convo_id, name:name});
+    let res_convo_obj = {
+    	conversationID:convo_id,
+    	name:name
+    };
+    for(let i = 0; i < user_ids.length; i++){
+    	if(!user_socket_map.hasOwnProperty(user_ids[i])) continue;
+    	const map = user_socket_map[user_ids[i]];
+    	let socket_ids = Object.keys(map);
+    	for(let j = 0; j < socket_ids.length; j++){
+    		console.log('emitting new convo to socket: ', socket_ids[j]);
+    		map[socket_ids[j]].socket.emit('new_convo', res_convo_obj);
+    	}
+    }
+    res.send(res_convo_obj);
 });
 
 /*  digests object expected in form:
@@ -866,9 +909,60 @@ app.post('/msg_create', async (req, res)=>{
         console.error(err.message);
         return res.status(500).end();
     }
+
+    let username_promise = new Promise((res, rej)=>{
+    	db.get('select username from Users where UserID=?', [user_id], (err, row)=>{
+    		if(err) throw err;
+    		if(!row) throw new Error('unexpected missing user_id');
+    		res(row.username);
+    	});
+    })
+    let username;
+    try{
+    	username = await username_promise;
+    }
+    catch(err){
+    	console.error(err.message);
+    	return res.status(500).end();
+    }
+    const message_obj_prototype = {
+        sender:username,
+        digest:'deadd0d0',
+        time:req_time.getTime()
+    };
     let digests_promise = new Promise(async (res, rej)=>{
         let promises = [];
+        let d_sock_map = {};
+        let u_sock_map = {};
+        for (let i = 0; i < req_udigs.length; i++){
+        	if(!user_socket_map.hasOwnProperty(req_udigs[i].id)) continue;
+        	let curr_map = user_socket_map[req_udigs[i].id];
+        	let socket_ids = Object.keys(user_socket_map[req_udigs[i].id])
+        	for (let j = 0; j < socket_ids.length; j++){
+        		if(curr_map[socket_ids[j]].hasOwnProperty('device_id')){
+        			if(!d_sock_map.hasOwnProperty(curr_map[socket_ids[j]].device_id)){
+        				d_sock_map[curr_map[socket_ids[j]].device_id] = [];
+        			}
+        			d_sock_map[curr_map[socket_ids[j]].device_id].push(curr_map[socket_ids[j]].socket);
+        		}
+        		else{
+        			if(!u_sock_map.hasOwnProperty(req_udigs[i].id)){
+        				u_sock_map[req_udigs[i].id] = [];
+        			}
+        			u_sock_map[req_udigs[i].id].push(curr_map[socket_ids[j]].socket);
+        		}
+        	}
+        }
         for(let i = 0; i < req_udigs.length; i++){
+        	if(u_sock_map.hasOwnProperty(req_udigs[i].id)){
+        		const msg_obj = Object.assign({},message_obj_prototype);
+        		msg_obj.digest = req_udigs[i].digest;
+        		const arr = u_sock_map[req_udigs[i].id];
+        		for(let j = 0; j < arr.length; j++){
+        			console.log('emitting new message to socket: ', arr[j].id);
+        			arr[j].emit('new_message', req.body.conversationID, msg_obj);
+        		}
+        	}
             promises.push(new Promise((res, rej)=>{
                 db.run('insert into Digests(contents, MessageID, UserID) values(?,?,?)',
                     [req_udigs[i].digest, message_id, req_udigs[i].id], function(err){
@@ -879,6 +973,15 @@ app.post('/msg_create', async (req, res)=>{
             }));
         }
         for(let i = 0; i < req_ddigs.length; i++){
+        	if(d_sock_map.hasOwnProperty(req_ddigs[i].id)){
+        		const msg_obj = Object.assign({},message_obj_prototype);
+        		msg_obj.digest = req_ddigs[i].digest;
+        		const arr = d_sock_map[req_ddigs[i].id];
+        		for(let j = 0; j < arr.length; j++){
+        			console.log('emitting new message to socket: ', arr[j].id);
+        			arr[j].emit('new_message', req.body.conversationID, msg_obj);
+        		}
+        	}
             promises.push(new Promise((res, rej)=>{
                 db.run('insert into Digests(contents, MessageID, DeviceID) values(?,?,?)',
                     [req_ddigs[i].digest, message_id, req_ddigs[i].id], function(err){
