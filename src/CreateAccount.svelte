@@ -1,102 +1,179 @@
 <script>
 import {SHA3} from 'sha3';
 import Sodium from './sodium.js';
-var crypto_box_keypair;
-var crypto_box_seed_keypair;
-var crypto_box_seal;
-var crypto_box_seal_open;
-var from_string;
-var to_string;
-var to_hex;
-var sodium_set = false;
-Sodium.sodium.ready.then(function(res, ref){
-    sodium_set = true;
+const ajax_json_req = (req_obj, path) =>{
+    console.log(path);
+    return new Promise((res, rej)=>{
+        let req = new XMLHttpRequest();
+        req.open("POST", path, true);
+        req.setRequestHeader("Content-Type", "application/json");
+        req.send(JSON.stringify(req_obj));
+        req.onreadystatechange = () =>{
+            if(req.readyState != XMLHttpRequest.DONE) return;
+            if(req.status !== 200) rej(new Error('Error ' + req.status.toString()));
+            let response_obj = JSON.parse(req.response);
+            if(response_obj.hasOwnProperty('authStatus')){
+                if(response_obj.authStatus !== true){
+                    end_session();
+                }
+            }
+            if(response_obj.hasOwnProperty('error')) rej(new Error(response_obj.error));
+            res(response_obj);
+        };
+    }).catch((err)=>{
+        //must investigate how to do this properly
+        console.error(err.message);
+    });
+}
+let crypto_box_keypair;
+let crypto_box_seed_keypair;
+let crypto_box_seal;
+let crypto_box_seal_open;
+let from_string;
+let from_hex;
+let to_string;
+let to_hex;
+let sodium_set = false;
+let ajax_c_priv_key;
+let ajax_c_pub_key;
+let ajax_s_pub_key;
+let ajax_id_token;
+Sodium.sodium.ready.then(async (res, ref)=>{
     crypto_box_keypair = Sodium.sodium.crypto_box_keypair;
     crypto_box_seed_keypair = Sodium.sodium.crypto_box_seed_keypair;
     crypto_box_seal = Sodium.sodium.crypto_box_seal;
     crypto_box_seal_open = Sodium.sodium.crypto_box_seal_open;
     from_string = Sodium.sodium.from_string;
+    from_hex = Sodium.sodium.from_hex;
     to_string = Sodium.sodium.to_string;
     to_hex = Sodium.sodium.to_hex;
+    sodium_set = true;
+    let keypair = crypto_box_keypair();
+    ajax_c_priv_key = keypair.privateKey;
+    ajax_c_pub_key = keypair.publicKey;
+    const req_obj = {
+        publicKey:to_hex(ajax_c_pub_key)
+    };
+    let req = ajax_json_req(req_obj, '/keypair_req');
+    let res_obj;
+    try{
+        res_obj = await req;
+    }
+    catch(err){
+        return console.error(err.message);
+    }
+    ajax_s_pub_key = from_hex(res_obj.publicKey);
+    ajax_id_token = res_obj.idToken;
 });
+const s_ajax_json_req = (req_obj, path)=>{
+    console.log(path);
+    if(!sodium_set) return console.error('Sodium library not yet loaded');
+    if(!ajax_id_token) return console.error('cannot make secure request without server public key');
+    return new Promise((res, rej)=>{
+        const make_request = () =>{
+            const req_digest = crypto_box_seal(from_string(JSON.stringify(req_obj)), ajax_s_pub_key);
+            const to_send = {
+                encryptedObject:{
+                    idToken:ajax_id_token,
+                    digest:to_hex(req_digest)
+                }
+            };
+            let req = new XMLHttpRequest();
+            req.open("POST", path, true);
+            req.setRequestHeader("Content-Type", "application/json");
+            req.send(JSON.stringify(to_send));
+            req.onreadystatechange = async () =>{
+                if(req.readyState != XMLHttpRequest.DONE) return;
+                if(req.status !== 200) rej(new Error('Error ' + req.status.toString()));
+                let response_obj = JSON.parse(req.response);
+                if(response_obj.hasOwnProperty('authStatus')){
+                    if(response_obj.authStatus !== true){
+                        end_session();
+                    }
+                }
+                if(response_obj.hasOwnProperty('keypairStatus')){
+                    if(response_obj.keypairStatus !== true){
+                        //technically can infinite loop here if there's an issue with the server
+                        //possibly need to lock s_ajax_json_req function while this is occurring
+                        let promise = ajax_json_req(req_obj, '/keypair_req');
+                        let keypair = crypto_box_keypair();
+                        ajax_c_priv_key = keypair.privateKey;
+                        ajax_c_pub_key = keypair.publicKey;
+                        let promise_rv;
+                        try{
+                            promise_rv = await promise;
+                        }
+                        catch(err){
+                            return console.error(err.message);
+                        }
+                        ajax_s_pub_key = promise_rv.publicKey;
+                        ajax_id_token = promise_rv.idToken;
+                        return make_request();
+                    }
+                }
+                if(response_obj.hasOwnProperty('error')) rej(new Error(response_obj.error));
+                //at later point this response object will be encrypted
+                res(response_obj);
+            };
+        };
+        make_request();
+    });
+};
 let email;
 let email_confirm;
 let username;
 let password;
 let password_confirm;
-const submit_err_handler = (err) =>{
-	console.error(err.message);
-	alert(err.message);
-};
-const submit = () =>{
-    console.log('submitting form');
-    if(!sodium_set){console.error('Sodium library not yet loaded');return;};
+const submit = async () =>{
+    if(!sodium_set) return console.error('Sodium library not yet loaded');
+    if(email_confirm !== email){
+        alert("emails do not match");
+        return console.error("emails do not match");
+    }
+    if(password_confirm !== password){
+        alert("passwords do not match");
+        return console.error("passwords do not match");
+    }
+    let req_obj = {
+        action:'new'
+    };
+    let req = s_ajax_json_req(req_obj, '/salts_req');
+    let res_obj;
     try{
-        if(email_confirm !== email){throw new Error("emails do not match");}
-        if(password_confirm !== password){throw new Error("passwords do not match");}
-        let clientSalt;
-        let keygenSalt;
-        let salts_req = new XMLHttpRequest();
-        salts_req.open("POST", "/salts_req", true);
-        salts_req.setRequestHeader("Content-Type", "application/json");
-        salts_req.send(JSON.stringify({
-            action:'new'
-        }));
-        salts_req.onreadystatechange = () => {
-            if(salts_req.readyState != XMLHttpRequest.DONE){return;}
-            if(salts_req.status === 200){
-                let response_obj = JSON.parse(salts_req.response);
-                console.log(response_obj);
-                clientSalt = response_obj.clientSalt;
-                keygenSalt = response_obj.keygenSalt;
-            }
-            else{
-                throw new Error('Error with ajax request for salts');
-            }
-            const client_hash = new SHA3(256);
-            client_hash.update(password + clientSalt);
-            const keygen_hash = new SHA3(256);
-            keygen_hash.update(password + keygenSalt);
-            const key_pair = crypto_box_seed_keypair(keygen_hash.digest('ascii'));
-            let acc_req = new XMLHttpRequest();
-            acc_req.open("POST", "/create_account", true);
-            acc_req.setRequestHeader("Content-Type", "application/json");
-            acc_req.send(JSON.stringify({
-                username:username,
-                hash:client_hash.digest('hex'),
-                publicKey:to_hex(key_pair.publicKey),
-                clientSalt:clientSalt,
-                keygenSalt:keygenSalt,
-                email:email
-            }));
-            console.log('acc_req sent');
-            acc_req.onreadystatechange = () =>{
-                if(acc_req.readyState != XMLHttpRequest.DONE){return;}
-                console.log('acc_req received');
-                if(acc_req.status === 200){
-                    let response_obj = JSON.parse(acc_req.response);
-                    console.log(response_obj);
-                    if(response_obj.hasOwnProperty('authToken')){
-                        localStorage.setItem('authToken', response_obj.authToken);
-                        localStorage.setItem('privateKey', key_pair.privateKey);
-                        localStorage.setItem('publicKey', key_pair.publicKey);
-                        localStorage.setItem('username', username);
-                        window.location.href = "/";
-                    }
-                    else if(response_obj.hasOwnProperty('error')){
-                        submit_err_handler(new Error(response_obj.error));
-                    }
-                    else{
-                        submit_err_handler(new Error('invalid server response'));
-                    }
-                }
-            }
-        }
+        res_obj = await req;
     }
     catch(err){
-        submit_err_handler(err);
+        return console.error(err.message);
     }
-};
+    let clientSalt = res_obj.clientSalt;
+    let keygenSalt = res_obj.keygenSalt;
+    const client_hash = new SHA3(256);
+    client_hash.update(password + clientSalt);
+    const keygen_hash = new SHA3(256);
+    keygen_hash.update(password + keygenSalt);
+    const key_pair = crypto_box_seed_keypair(keygen_hash.digest('ascii'));
+    req_obj = {
+        username:username,
+        hash:client_hash.digest('hex'),
+        publicKey:to_hex(key_pair.publicKey),
+        clientSalt:clientSalt,
+        keygenSalt:keygenSalt,
+        email:email
+    };
+    req = s_ajax_json_req(req_obj, '/create_account');
+    try{
+        res_obj = await req;
+    }
+    catch(err){
+        alert(err.message);
+        return console.error(err.message);
+    }
+    localStorage.setItem('authToken', res_obj.authToken);
+    //possibly rethink how private key is stored
+    localStorage.setItem('privateKey', key_pair.privateKey);
+    localStorage.setItem('publicKey', key_pair.publicKey);
+    window.location.href = "/";
+}
 </script>
 <h1>Create Account</h1>
 <form on:submit|preventDefault={submit}>

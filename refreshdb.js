@@ -90,6 +90,15 @@ db.serialize(function(){
         FOREIGN KEY(DeviceID) REFERENCES Devices(DeviceID),
         FOREIGN KEY(UserID) REFERENCES Users(UserID))
     `);
+    db.run(`
+        create table IF NOT EXISTS KeyPair
+        (KeyPairID INTEGER PRIMARY KEY,
+        id_token TEXT NOT NULL UNIQUE,
+        server_public_key TEXT NOT NULL,
+        server_private_key TEXT NOT NULL,
+        client_public_key TEXT NOT NULL,
+        expiration INTEGER NOT NULL)
+    `);
     db.run('commit transaction');
 });
 db.close((err)=>{

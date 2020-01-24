@@ -1,8 +1,24 @@
 <script>
 	import io_wrapper from './socket.io.js';
+	import Sodium from './sodium.js';
 	const authToken = localStorage.getItem('authToken');
 	const publicKey = localStorage.getItem('publicKey');
-	const privateKey = localStorage.getItem('privateKey');
+	//below snippet from:
+	//https://stackoverflow.com/questions/179355/clearing-all-cookies-with-javascript
+	function deleteAllCookies() {
+	    const cookies = document.cookie.split(";");
+	    for (var i = 0; i < cookies.length; i++) {
+	    	const cookie = cookies[i];
+	        const eqPos = cookie.indexOf("=");
+	        const name = eqPos > -1 ? cookie.substr(0, eqPos) : cookie;
+	        document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT";
+	    }
+	}
+	const end_session = () =>{
+		localStorage.clear();
+		deleteAllCookies();
+		window.locatio.href = "/login";
+	}
 	const ajax_json_req = (req_obj, path) =>{
 		console.log(path);
 		return new Promise((res, rej)=>{
@@ -14,6 +30,11 @@
 				if(req.readyState != XMLHttpRequest.DONE) return;
 				if(req.status !== 200) rej(new Error('Error ' + req.status.toString()));
 				let response_obj = JSON.parse(req.response);
+				if(response_obj.hasOwnProperty('authStatus')){
+					if(response_obj.authStatus !== true){
+						end_session();
+					}
+				}
 				if(response_obj.hasOwnProperty('error')) rej(new Error(response_obj.error));
 				res(response_obj);
 			};
@@ -22,20 +43,121 @@
 			console.error(err.message);
 		});
 	}
-
+	let crypto_box_keypair;
+	let crypto_box_seed_keypair;
+	let crypto_box_seal;
+	let crypto_box_seal_open;
+	let from_string;
+	let from_hex;
+	let to_string;
+	let to_hex;
+	let sodium_set = false;
+	let ajax_c_priv_key;
+	let ajax_c_pub_key;
+	let ajax_s_pub_key;
+	let ajax_id_token;
+	Sodium.sodium.ready.then(async (res, ref)=>{
+	    crypto_box_keypair = Sodium.sodium.crypto_box_keypair;
+	    crypto_box_seed_keypair = Sodium.sodium.crypto_box_seed_keypair;
+	    crypto_box_seal = Sodium.sodium.crypto_box_seal;
+	    crypto_box_seal_open = Sodium.sodium.crypto_box_seal_open;
+	    from_string = Sodium.sodium.from_string;
+	    from_hex = Sodium.sodium.from_hex;
+	    to_string = Sodium.sodium.to_string;
+	    to_hex = Sodium.sodium.to_hex;
+	    sodium_set = true;
+	    let keypair = crypto_box_keypair();
+	    ajax_c_priv_key = keypair.privateKey;
+	    ajax_c_pub_key = keypair.publicKey;
+	    const req_obj = {
+	    	publicKey:to_hex(ajax_c_pub_key)
+	    };
+	    let req = ajax_json_req(req_obj, '/keypair_req');
+	    let res_obj;
+	    try{
+	    	res_obj = await req;
+	    }
+	    catch(err){
+	    	return console.error(err.message);
+	    }
+	    console.log(res_obj.publicKey);
+	    ajax_s_pub_key = from_hex(res_obj.publicKey);
+	    ajax_id_token = res_obj.idToken;
+	});
+	const s_ajax_json_req = (req_obj, path)=>{
+		console.log(path);
+		if(!sodium_set) return console.error('Sodium library not yet loaded');
+		if(!ajax_id_token) return console.error('cannot make secure request without server public key');
+		return new Promise((res, rej)=>{
+			const make_request = () =>{
+				const req_digest = crypto_box_seal(from_string(JSON.stringify(req_obj)), ajax_s_pub_key);
+				const to_send = {
+					encryptedObject:{
+						idToken:ajax_id_token,
+						digest:to_hex(req_digest)
+					}
+				};
+				let req = new XMLHttpRequest();
+				req.open("POST", path, true);
+				req.setRequestHeader("Content-Type", "application/json");
+				req.send(JSON.stringify(to_send));
+				req.onreadystatechange = async () =>{
+					if(req.readyState != XMLHttpRequest.DONE) return;
+					if(req.status !== 200) rej(new Error('Error ' + req.status.toString()));
+					let response_obj = JSON.parse(req.response);
+					if(response_obj.hasOwnProperty('authStatus')){
+						if(response_obj.authStatus !== true){
+							end_session();
+						}
+					}
+					if(response_obj.hasOwnProperty('keypairStatus')){
+						if(response_obj.keypairStatus !== true){
+							//technically can infinite loop here if there's an issue with the server
+							//possibly need to lock s_ajax_json_req function while this is occurring
+							let promise = ajax_json_req(req_obj, '/keypair_req');
+							let keypair = crypto_box_keypair();
+							ajax_c_priv_key = keypair.privateKey;
+							ajax_c_pub_key = keypair.publicKey;
+							let promise_rv;
+							try{
+								promise_rv = await promise;
+							}
+							catch(err){
+								return console.error(err.message);
+							}
+							ajax_s_pub_key = promise_rv.publicKey;
+							ajax_id_token = promise_rv.idToken;
+							return make_request();
+						}
+					}
+					if(response_obj.hasOwnProperty('error')) rej(new Error(response_obj.error));
+					//at later point this response object will be encrypted
+					res(response_obj);
+				};
+			};
+			make_request();
+		});
+	};
+	const privateKey = localStorage.getItem('privateKey');
+	if(privateKey == null){
+		end_session();
+	}
 	let username = localStorage.getItem('username');
 	if(username == null){
 		const get_username = async () =>{
 			let req_obj = {
 				authToken:authToken
 			};
-			let promise = ajax_json_req(req_obj, '/user_req', true);
+			let promise = s_ajax_json_req(req_obj, '/user_req', true);
+			let res_obj;
 			try{
-				username = await promise;
+				res_obj = await promise;
 			}
 			catch(err){
 				console.error(err.message);
 			}
+			username = res_obj.username;
+			localStorage.setItem('username', username);
 		};
 		get_username();
 	}
@@ -44,6 +166,7 @@
 	const conversation_obj_prototype = {
 		id:-1,
 		name:'default_name',
+		last_msg_sender:'default_sender',
 		last_msg:'default_msg',
 		keys:{}
 	};
@@ -75,7 +198,7 @@
 		let req_obj = {
 			authToken:authToken
 		};
-		let promise = ajax_json_req(req_obj, '/convo_req');
+		let promise = s_ajax_json_req(req_obj, '/convo_req');
 		let res_obj;
 		try{
 			res_obj = await promise;
@@ -94,7 +217,7 @@
 				authToken:authToken,
 				conversationID:new_convo_obj.id
 			};
-			promise = ajax_json_req(req_obj, '/keys_req');
+			promise = s_ajax_json_req(req_obj, '/keys_req');
 			let keys_obj;
 			try{
 				keys_obj = await promise;
@@ -129,7 +252,7 @@
 			participants:req_participants
 		};
 		if(new_conversation_name.length > 0) req_obj.name=new_conversation_name;
-		let promise = ajax_json_req(req_obj, '/conversation_create');
+		let promise = s_ajax_json_req(req_obj, '/conversation_create');
 		let response_obj;
 		try{
 			response_obj = await promise;
@@ -144,7 +267,7 @@
 			authToken:authToken,
 			conversationID:convo_id
 		};
-		promise = ajax_json_req(req_obj, '/keys_req');
+		promise = s_ajax_json_req(req_obj, '/keys_req');
 		try{
 			response_obj = await promise;
 		}
@@ -157,7 +280,7 @@
 			authToken:authToken,
 			conversationID:convo_id
 		};
-		promise = ajax_json_req(req_obj, '/last_msg_req');
+		promise = s_ajax_json_req(req_obj, '/last_msg_req');
 		try{
 			response_obj = await promise;
 		}
@@ -199,7 +322,7 @@
 			authToken:authToken,
 			conversationID:id
 		};
-		let promise = ajax_json_req(req_obj, '/messages_req');
+		let promise = s_ajax_json_req(req_obj, '/messages_req');
 		let res_obj;
 		try{
 			res_obj = await promise;
@@ -249,7 +372,7 @@
 				digest:msg
 			});
 		}
-		let promise = ajax_json_req(req_obj, '/msg_create');
+		let promise = s_ajax_json_req(req_obj, '/msg_create');
 		let res_obj;
 		try{
 			res_obj = await promise;
@@ -301,7 +424,7 @@
 			authToken:authToken,
 			conversationID:new_convo_obj.id
 		};
-		let promise = ajax_json_req(req_obj, '/keys_req');
+		let promise = s_ajax_json_req(req_obj, '/keys_req');
 		let keys_obj;
 		try{
 			keys_obj = await promise;
