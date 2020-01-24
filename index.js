@@ -249,6 +249,7 @@ app.use(bodyParser.urlencoded({extended:false}));
 app.use(bodyParser.json());
 app.use(cookieParser());
 app.use(async (req, res, next)=>{
+	req.is_secure_protocol = false;
 	if(req.body == null) next();
 	try{
 		if(req.body.hasOwnProperty('encryptedObject')){
@@ -277,6 +278,7 @@ app.use(async (req, res, next)=>{
 			//creating a seperate variable so that the json error can be caught
 			//without adding an attribute to the request object
 			let decrypted_obj = JSON.parse(decrypted);
+			req.is_secure_protocol = true;
 			req.decrypted_obj = decrypted_obj;
 		}
 	}
@@ -971,7 +973,7 @@ app.post('/msg_create', async (req, res)=>{
                 userDigests:[{
                     id:'number',
                     //change to hex when adding encryption
-                    digest:'string'
+                    digest:'hex'
                 }],
                 deviceDigests:[{
                     id:'number',

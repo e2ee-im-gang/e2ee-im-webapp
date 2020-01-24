@@ -155,10 +155,11 @@ const submit = async () =>{
         alert(err.message);
         return console.error(err.message);
     }
+    localStorage.clear();
     localStorage.setItem('authToken', res_obj.authToken);
     //possibly rethink how private key is stored
-    localStorage.setItem('privateKey', key_pair.privateKey);
-    localStorage.setItem('publicKey', key_pair.publicKey);
+    localStorage.setItem('privateKey', to_hex(key_pair.privateKey));
+    localStorage.setItem('publicKey', to_hex(key_pair.publicKey));
     window.location.href = "/";
 };
 </script>

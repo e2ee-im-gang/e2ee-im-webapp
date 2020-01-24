@@ -2,7 +2,8 @@
 	import io_wrapper from './socket.io.js';
 	import Sodium from './sodium.js';
 	const authToken = localStorage.getItem('authToken');
-	const publicKey = localStorage.getItem('publicKey');
+	let publicKey = localStorage.getItem('publicKey');
+	let privateKey = localStorage.getItem('privateKey');
 	//below snippet from:
 	//https://stackoverflow.com/questions/179355/clearing-all-cookies-with-javascript
 	function deleteAllCookies() {
@@ -17,7 +18,10 @@
 	const end_session = () =>{
 		localStorage.clear();
 		deleteAllCookies();
-		window.locatio.href = "/login";
+		window.location.href = "/login";
+	}
+	if(privateKey == null){
+		end_session();
 	}
 	const ajax_json_req = (req_obj, path) =>{
 		console.log(path);
@@ -43,6 +47,16 @@
 			console.error(err.message);
 		});
 	}
+	const secure_on_startup = ()=>{
+		//imperative nothing using encryption runs before
+		//libsodium is loaded
+		publicKey = from_hex(publicKey);
+		privateKey = from_hex(privateKey);
+		if(username == null){
+			get_username();
+		}
+		populate_convos();
+	};
 	let crypto_box_keypair;
 	let crypto_box_seed_keypair;
 	let crypto_box_seal;
@@ -80,9 +94,9 @@
 	    catch(err){
 	    	return console.error(err.message);
 	    }
-	    console.log(res_obj.publicKey);
 	    ajax_s_pub_key = from_hex(res_obj.publicKey);
 	    ajax_id_token = res_obj.idToken;
+	    secure_on_startup();
 	});
 	const s_ajax_json_req = (req_obj, path)=>{
 		console.log(path);
@@ -138,29 +152,23 @@
 			make_request();
 		});
 	};
-	const privateKey = localStorage.getItem('privateKey');
-	if(privateKey == null){
-		end_session();
-	}
 	let username = localStorage.getItem('username');
-	if(username == null){
-		const get_username = async () =>{
-			let req_obj = {
-				authToken:authToken
-			};
-			let promise = s_ajax_json_req(req_obj, '/user_req', true);
-			let res_obj;
-			try{
-				res_obj = await promise;
-			}
-			catch(err){
-				console.error(err.message);
-			}
-			username = res_obj.username;
-			localStorage.setItem('username', username);
+	const get_username = async () =>{
+		let req_obj = {
+			authToken:authToken
 		};
-		get_username();
-	}
+		let promise = s_ajax_json_req(req_obj, '/user_req', true);
+		let res_obj;
+		try{
+			res_obj = await promise;
+		}
+		catch(err){
+			console.error(err.message);
+		}
+		username = res_obj.username;
+		localStorage.setItem('username', username);
+		console.log('username: ', username);
+	};
 	let conversation_list = [];
 	let conversation_refs = {};
 	const conversation_obj_prototype = {
@@ -211,8 +219,10 @@
 			let new_convo_obj = Object.create(conversation_obj_prototype);
 			new_convo_obj.id = res_obj.conversationObjects[i].id;
 			new_convo_obj.name = res_obj.conversationObjects[i].name;
-			//not decrypting digest for now
-			new_convo_obj.last_msg = res_obj.conversationObjects[i].last_msg_digest;
+			if(res_obj.conversationObjects[i].last_msg_digest.length == 0)
+				new_convo_obj.last_msg = '';
+			else
+				new_convo_obj.last_msg = to_string(crypto_box_seal_open(from_hex(res_obj.conversationObjects[i].last_msg_digest), publicKey, privateKey));
 			req_obj = {
 				authToken:authToken,
 				conversationID:new_convo_obj.id
@@ -232,7 +242,6 @@
 		}
 		conversation_list = conversation_list;
 	};
-	populate_convos();
 
 	let display_add_account = false;
 	const display_add = () =>{
@@ -294,7 +303,9 @@
 		const new_convo_obj = Object.create(conversation_obj_prototype);
 		new_convo_obj.id = convo_id;
 		new_convo_obj.name = name;
-		new_convo_obj.last_msg = digest;
+		if(digest.length == 0) new_convo_obj.last_msg = '';
+		else
+			new_convo_obj.last_msg = to_string(crypto_box_seal_open(from_hex(digest), publicKey, privateKey));
 		new_convo_obj.keys = keys;
 		conversation_list.push(new_convo_obj);
 		//updating because svelte
@@ -310,7 +321,11 @@
 		let rv = Object.create(message_obj_prototype);
 		rv.sender = res.sender;
 		//add decryption here later
-		rv.contents = res.digest;
+		if(res.digest.length == 0)
+			rv.contents = '';
+		else{
+			rv.contents = to_string(crypto_box_seal_open(from_hex(res.digest), publicKey, privateKey));
+		}
 		rv.time = get_fmtted_time(new Date(res.time));
 		rv.from_you = username === res.sender;
 		return rv;
@@ -358,18 +373,17 @@
 				deviceDigests:[]
 			}
 		};
+		const msg_buf = from_string(msg);
 		for(let i = 0; i < convo_obj.keys.userKeys.length; i++){
 			req_obj.digests.userDigests.push({
 				id:convo_obj.keys.userKeys[i].id,
-				//add encryption here later
-				digest:msg
+				digest:to_hex(crypto_box_seal(msg_buf, from_hex(convo_obj.keys.userKeys[i].key)))
 			});
 		}
 		for(let i = 0; i < convo_obj.keys.deviceKeys.length; i++){
 			req_obj.digests.deviceDigests.push({
 				id:convo_obj.keys.deviceKeys[i].id,
-				//add encryption here later
-				digest:msg
+				digest:to_hex(crypto_box_seal(msg_buf, from_hex(convo_obj.keys.deviceKeys[i].key)))
 			});
 		}
 		let promise = s_ajax_json_req(req_obj, '/msg_create');
@@ -412,7 +426,6 @@
 		}
 		//possible race condition with conversation creating at the
 		//same time as the first message is sent
-		//add decryption here eventually
 		conversation_refs[convo_id].last_msg = msg_obj.contents;
 		conversation_list = conversation_list;
 	});
@@ -521,7 +534,7 @@
 		clear:both;
 	}
 	.conversation_wrapper{
-		height:90%;
+		height:80%;
 		overflow-y: scroll;
 	}
 	.convo_box{
@@ -577,6 +590,19 @@
   		-moz-appearance: none;
   		position:fixed;
 	}
+	.logout_wrapper{
+		width:100%;
+		height:10%;
+		text-align:center;
+	}
+	.logout_wrapper button{
+		padding:5px, 5px, 5px, 5px;
+		line-height: 100%;
+		display:inline-block;
+		height:100%;
+		width:100%;
+		font-size:30px;
+	}
 </style>
 
 
@@ -605,6 +631,9 @@
 			</div>
 			</label>
 			{/each}
+		</div>
+		<div class="logout_wrapper">
+			<button on:click={end_session}>logout</button>
 		</div>
 	</div>
 	<div class="column right">
