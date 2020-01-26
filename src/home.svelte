@@ -1,19 +1,124 @@
 <script>
-	import io_wrapper from './socket.io.js';
+	import io from 'socket.io-client';
 	import Sodium from './sodium.js';
+	import parser from 'socket.io-parser';
 	const authToken = localStorage.getItem('authToken');
 	let publicKey = localStorage.getItem('publicKey');
 	let privateKey = localStorage.getItem('privateKey');
+	let username = localStorage.getItem('username');
+
+	//global prototypes
+	const digest_obj_prototype = {
+		id:-1,
+		digest:'deadd0d0'
+	};
+	const conversation_obj_prototype = {
+		id:-1,
+		name:'default_name',
+		last_msg_sender:'default_sender',
+		last_msg:'default_msg',
+		keys:{}
+	};
+	const message_obj_prototype = {
+		sender:'username-here',
+		contents:'contents of message goes here',
+		time:'formatted time string goes here',
+		from_you:false
+	};
+
+	//socket handling begin
+	const socket = io('/');
+	socket.s_emit = (...args)=>{
+		if(!socket.is_secure_protocol) return socket.emit(...args);
+		let digests = [];
+		for(let i = 0; i < args.length; i++){
+			const digest = crypto_box_seal(from_string(JSON.stringify(args[i])), socket.s_public_key).toString('hex');
+			digests.push(digest);
+		}
+		socket.emit(...digests);
+	};
+	//in lieu of middleware
+	//this is the most straightforward option
+	socket.s_rec_parser = (...args)=>{
+		if(!socket.is_secure_protocol) return args;
+		let rv = [];
+		for(let i = 0; i < args.length; i++){
+			const decrypted = crypto_box_seal_open(from_hex(args[i]), socket.c_public_key, socket.c_private_key);
+			rv.push(JSON.parse(to_string(decrypted)));
+		}
+		return rv;
+	};
+	socket.on('secure_res', (public_key)=>{
+		socket.s_public_key = from_hex(public_key);
+		socket.is_secure_protocol = true;
+	});
+	socket.on('auth_req', ()=>{
+		socket.s_emit('auth_res', authToken);
+	});
+	socket.on('auth_status', (status)=>{
+		if(status!=='accepted'){
+			console.error('socket responded with status: ', status);
+			socket.close();
+		}
+	})
+	socket.on('new_message', (convo_id, message_obj)=>{
+		let args = socket.s_rec_parser(convo_id, message_obj);
+		convo_id = args[0];
+		message_obj = args[1];
+		let msg_obj = create_message_obj(message_obj);
+		if(conversation_list[open_convo_val].id == convo_id){
+			message_list.push(msg_obj);
+			message_list = message_list;
+			messages_ref.scrollTop = messages_ref.scrollHeight;
+		}
+		//possible race condition with conversation creating at the
+		//same time as the first message is sent
+		conversation_refs[convo_id].last_msg = msg_obj.contents;
+		conversation_list = conversation_list;
+	});
+	socket.on('new_convo', async (convo_obj)=>{
+		let args = socket.s_rec_parser(convo_obj);
+		convo_obj = args[0];
+		const new_convo_obj = Object.create(conversation_obj_prototype);
+		new_convo_obj.id = convo_obj.conversationID;
+		new_convo_obj.name = convo_obj.name;
+		const req_obj = {
+			authToken:authToken,
+			conversationID:new_convo_obj.id
+		};
+		let promise = s_ajax_json_req(req_obj, '/keys_req');
+		let keys_obj;
+		try{
+			keys_obj = await promise;
+		}
+		catch(err){
+			return console.error(err.message);
+		}
+		new_convo_obj.keys = keys_obj;
+		new_convo_obj.last_msg = '';
+		conversation_refs[new_convo_obj.id] = new_convo_obj;
+		conversation_list.push(new_convo_obj);
+		conversation_list = conversation_list;
+	});
+	const secure_socket = () =>{
+		const keypair = crypto_box_keypair();
+		socket.c_public_key = keypair.publicKey;
+		socket.c_private_key = keypair.privateKey;
+		socket.emit('secure_req', to_hex(socket.c_public_key));
+	}
+	//investigate behaviour of server disconnects with socket
+	//socket handling end
+
 	//below snippet from:
 	//https://stackoverflow.com/questions/179355/clearing-all-cookies-with-javascript
 	function deleteAllCookies() {
-	    const cookies = document.cookie.split(";");
-	    for (var i = 0; i < cookies.length; i++) {
-	    	const cookie = cookies[i];
-	        const eqPos = cookie.indexOf("=");
-	        const name = eqPos > -1 ? cookie.substr(0, eqPos) : cookie;
-	        document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT";
-	    }
+		const cookies = document.cookie.split(";");
+		for (var i = 0; i < cookies.length; i++) {
+			const cookie = cookies[i];
+			const eqPos = cookie.indexOf("=");
+			const name = eqPos > -1 ? cookie.substr(0, eqPos) : cookie;
+			document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT";
+		}
 	}
 	const end_session = () =>{
 		localStorage.clear();
@@ -46,58 +151,7 @@
 			//must investigate how to do this properly
 			console.error(err.message);
 		});
-	}
-	const secure_on_startup = ()=>{
-		//imperative nothing using encryption runs before
-		//libsodium is loaded
-		publicKey = from_hex(publicKey);
-		privateKey = from_hex(privateKey);
-		if(username == null){
-			get_username();
-		}
-		populate_convos();
 	};
-	let crypto_box_keypair;
-	let crypto_box_seed_keypair;
-	let crypto_box_seal;
-	let crypto_box_seal_open;
-	let from_string;
-	let from_hex;
-	let to_string;
-	let to_hex;
-	let sodium_set = false;
-	let ajax_c_priv_key;
-	let ajax_c_pub_key;
-	let ajax_s_pub_key;
-	let ajax_id_token;
-	Sodium.sodium.ready.then(async (res, ref)=>{
-	    crypto_box_keypair = Sodium.sodium.crypto_box_keypair;
-	    crypto_box_seed_keypair = Sodium.sodium.crypto_box_seed_keypair;
-	    crypto_box_seal = Sodium.sodium.crypto_box_seal;
-	    crypto_box_seal_open = Sodium.sodium.crypto_box_seal_open;
-	    from_string = Sodium.sodium.from_string;
-	    from_hex = Sodium.sodium.from_hex;
-	    to_string = Sodium.sodium.to_string;
-	    to_hex = Sodium.sodium.to_hex;
-	    sodium_set = true;
-	    let keypair = crypto_box_keypair();
-	    ajax_c_priv_key = keypair.privateKey;
-	    ajax_c_pub_key = keypair.publicKey;
-	    const req_obj = {
-	    	publicKey:to_hex(ajax_c_pub_key)
-	    };
-	    let req = ajax_json_req(req_obj, '/keypair_req');
-	    let res_obj;
-	    try{
-	    	res_obj = await req;
-	    }
-	    catch(err){
-	    	return console.error(err.message);
-	    }
-	    ajax_s_pub_key = from_hex(res_obj.publicKey);
-	    ajax_id_token = res_obj.idToken;
-	    secure_on_startup();
-	});
 	const s_ajax_json_req = (req_obj, path)=>{
 		console.log(path);
 		if(!sodium_set) return console.error('Sodium library not yet loaded');
@@ -118,14 +172,20 @@
 				req.onreadystatechange = async () =>{
 					if(req.readyState != XMLHttpRequest.DONE) return;
 					if(req.status !== 200) rej(new Error('Error ' + req.status.toString()));
-					let response_obj = JSON.parse(req.response);
-					if(response_obj.hasOwnProperty('authStatus')){
-						if(response_obj.authStatus !== true){
+					let res_obj = JSON.parse(req.response);
+					if(res_obj.hasOwnProperty('encryptedObject')){
+						if(res_obj.idToken !== ajax_id_token)
+							throw new Error('Cannot decrypt response');
+						const decrypted_digest = crypto_box_seal_open(from_hex(res_obj.encryptedObject, ajax_c_pub_key, ajax_c_priv_key));
+						res_obj = JSON.parse(decrypted_digest);
+					}
+					if(res_obj.hasOwnProperty('authStatus')){
+						if(res_obj.authStatus !== true){
 							end_session();
 						}
 					}
-					if(response_obj.hasOwnProperty('keypairStatus')){
-						if(response_obj.keypairStatus !== true){
+					if(res_obj.hasOwnProperty('keypairStatus')){
+						if(res_obj.keypairStatus !== true){
 							//technically can infinite loop here if there's an issue with the server
 							//possibly need to lock s_ajax_json_req function while this is occurring
 							let promise = ajax_json_req(req_obj, '/keypair_req');
@@ -144,63 +204,12 @@
 							return make_request();
 						}
 					}
-					if(response_obj.hasOwnProperty('error')) rej(new Error(response_obj.error));
-					//at later point this response object will be encrypted
-					res(response_obj);
+					if(res_obj.hasOwnProperty('error')) rej(new Error(res_obj.error));
+					res(res_obj);
 				};
 			};
 			make_request();
 		});
-	};
-	let username = localStorage.getItem('username');
-	const get_username = async () =>{
-		let req_obj = {
-			authToken:authToken
-		};
-		let promise = s_ajax_json_req(req_obj, '/user_req', true);
-		let res_obj;
-		try{
-			res_obj = await promise;
-		}
-		catch(err){
-			console.error(err.message);
-		}
-		username = res_obj.username;
-		localStorage.setItem('username', username);
-		console.log('username: ', username);
-	};
-	let conversation_list = [];
-	let conversation_refs = {};
-	const conversation_obj_prototype = {
-		id:-1,
-		name:'default_name',
-		last_msg_sender:'default_sender',
-		last_msg:'default_msg',
-		keys:{}
-	};
-
-	let message_list = [];
-	const message_obj_prototype = {
-		sender:'username-here',
-		contents:'contents of message goes here',
-		time:'formatted time string goes here',
-		from_you:false
-	};
-	let messages_ref;
-	let curr_message;
-	let curr_convo_obj;
-	const get_fmtted_time = (date_obj) =>{
-		const year = (1900 + date_obj.getYear()).toString();
-		const month = ('0' + (1 + date_obj.getMonth()).toString()).slice(-2);
-		const day = date_obj.getDate().toString();
-		const hours = ('0' + date_obj.getHours().toString()).slice(-2);
-		const minutes = ('0' + date_obj.getMinutes().toString()).slice(-2);
-		const seconds = ('0' + date_obj.getSeconds().toString()).slice(-2);
-		return year + '-' + month + '-' + day + ' ' + hours + ':' + minutes + ':' + seconds;
-	};
-	const digest_obj_prototype = {
-		id:-1,
-		digest:'deadd0d0'
 	};
 	const populate_convos = async () =>{
 		let req_obj = {
@@ -241,6 +250,90 @@
 			conversation_list.push(new_convo_obj);
 		}
 		conversation_list = conversation_list;
+	};
+	const get_username = async () =>{
+		let req_obj = {
+			authToken:authToken
+		};
+		let promise = s_ajax_json_req(req_obj, '/user_req', true);
+		let res_obj;
+		try{
+			res_obj = await promise;
+		}
+		catch(err){
+			console.error(err.message);
+		}
+		username = res_obj.username;
+		localStorage.setItem('username', username);
+		console.log('username: ', username);
+	};
+	const secure_on_startup = ()=>{
+		//imperative nothing using encryption runs before
+		//libsodium is loaded
+		publicKey = from_hex(publicKey);
+		privateKey = from_hex(privateKey);
+		if(username == null){
+			get_username();
+		}
+		populate_convos();
+		secure_socket();
+	};
+	let crypto_box_keypair;
+	let crypto_box_seed_keypair;
+	let crypto_box_seal;
+	let crypto_box_seal_open;
+	let from_string;
+	let from_hex;
+	let to_string;
+	let to_hex;
+	let sodium_set = false;
+	let ajax_c_priv_key;
+	let ajax_c_pub_key;
+	let ajax_s_pub_key;
+	let ajax_id_token;
+	Sodium.sodium.ready.then(async (res, ref)=>{
+		crypto_box_keypair = Sodium.sodium.crypto_box_keypair;
+		crypto_box_seed_keypair = Sodium.sodium.crypto_box_seed_keypair;
+		crypto_box_seal = Sodium.sodium.crypto_box_seal;
+		crypto_box_seal_open = Sodium.sodium.crypto_box_seal_open;
+		from_string = Sodium.sodium.from_string;
+		from_hex = Sodium.sodium.from_hex;
+		to_string = Sodium.sodium.to_string;
+		to_hex = Sodium.sodium.to_hex;
+		sodium_set = true;
+		let keypair = crypto_box_keypair();
+		ajax_c_priv_key = keypair.privateKey;
+		ajax_c_pub_key = keypair.publicKey;
+		const req_obj = {
+			publicKey:to_hex(ajax_c_pub_key)
+		};
+		let req = ajax_json_req(req_obj, '/keypair_req');
+		let res_obj;
+		try{
+			res_obj = await req;
+		}
+		catch(err){
+			return console.error(err.message);
+		}
+		ajax_s_pub_key = from_hex(res_obj.publicKey);
+		ajax_id_token = res_obj.idToken;
+		secure_on_startup();
+	});
+	let conversation_list = [];
+	let conversation_refs = {};
+
+	let message_list = [];
+	let messages_ref;
+	let curr_message;
+	let curr_convo_obj;
+	const get_fmtted_time = (date_obj) =>{
+		const year = (1900 + date_obj.getYear()).toString();
+		const month = ('0' + (1 + date_obj.getMonth()).toString()).slice(-2);
+		const day = date_obj.getDate().toString();
+		const hours = ('0' + date_obj.getHours().toString()).slice(-2);
+		const minutes = ('0' + date_obj.getMinutes().toString()).slice(-2);
+		const seconds = ('0' + date_obj.getSeconds().toString()).slice(-2);
+		return year + '-' + month + '-' + day + ' ' + hours + ':' + minutes + ':' + seconds;
 	};
 
 	let display_add_account = false;
@@ -406,53 +499,6 @@
 		curr_message = '';
 	};
 
-	//socket handling begin
-	const socket = io_wrapper.io('/');
-	socket.on('auth_req', ()=>{
-		socket.emit('auth_res', authToken);
-	});
-	socket.on('auth_status', (status)=>{
-		if(status!=='accepted'){
-			console.error('socket responded with status: ', status);
-			socket.close();
-		}
-	})
-	socket.on('new_message', (convo_id, message_obj)=>{
-		let msg_obj = create_message_obj(message_obj);
-		if(conversation_list[open_convo_val].id == convo_id){
-			message_list.push(msg_obj);
-			message_list = message_list;
-			messages_ref.scrollTop = messages_ref.scrollHeight;
-		}
-		//possible race condition with conversation creating at the
-		//same time as the first message is sent
-		conversation_refs[convo_id].last_msg = msg_obj.contents;
-		conversation_list = conversation_list;
-	});
-	socket.on('new_convo', async (convo_obj)=>{
-		const new_convo_obj = Object.create(conversation_obj_prototype);
-		new_convo_obj.id = convo_obj.conversationID;
-		new_convo_obj.name = convo_obj.name;
-		const req_obj = {
-			authToken:authToken,
-			conversationID:new_convo_obj.id
-		};
-		let promise = s_ajax_json_req(req_obj, '/keys_req');
-		let keys_obj;
-		try{
-			keys_obj = await promise;
-		}
-		catch(err){
-			return console.error(err.message);
-		}
-		new_convo_obj.keys = keys_obj;
-		new_convo_obj.last_msg = '';
-		conversation_refs[new_convo_obj.id] = new_convo_obj;
-		conversation_list.push(new_convo_obj);
-		conversation_list = conversation_list;
-	});
-	//socket handling end
-
 </script>
 
 <style>
@@ -472,8 +518,8 @@
 		width:600px;
 		height:400px;
 		top: 50%;
-        left: 50%;
-        margin-top: -200px;
+		left: 50%;
+		margin-top: -200px;
 		margin-left: -300px;
 	}
 	.show{
@@ -587,8 +633,8 @@
 	.convo_radio_wrapper{
 		appearance:none;
 		-webkit-appearance: none;
-  		-moz-appearance: none;
-  		position:fixed;
+		-moz-appearance: none;
+		position:fixed;
 	}
 	.logout_wrapper{
 		width:100%;

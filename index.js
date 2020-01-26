@@ -51,9 +51,22 @@ const generate_hash_token = () =>{
     return rv_buf.toString('hex');
 };
 
+const is_hex = (str) =>{
+	if(typeof str != 'string') return false;
+	for(let i = 0; i < str.length; i++){
+		if(!('0' <= str[i] && str[i] <= '9') && !('a' <= str[i] && str[i] <= 'f')) return false;
+	}
+	return true;
+};
+
+const is_key = (str)=>{
+	if(!is_hex(str)) return false;
+	return str.length == 64;
+};
+
 //returns -1 for invalid auth token
 //returns userID for valid token
-async function verify_auth_token(token){
+const verify_auth_token = async (token)=>{
     let rv_promise = new Promise(async(res, rej)=>{
         let promise = new Promise((res, rej)=>{
             db.get('select UserID, expiration from AuthTokens where token=?', [token], (err, row)=>{
@@ -85,13 +98,46 @@ async function verify_auth_token(token){
 let user_socket_map = {};
 let socket_user_map = {};
 
-io.on('connection', function(socket){
-	socket.emit('auth_req');
+io.on('connection', (socket)=>{
+	socket.is_secure_protocol = false;
+	socket.use((packet, next)=>{
+		if(!socket.is_secure_protocol) return next();
+		let new_packet = [packet[0]];
+		for(let i = 1; i < packet.length; i++){
+			const decrypted = sodium.crypto_box_seal_open(Buffer.from(packet[i], 'hex'), socket.s_public_key, socket.s_private_key);
+			new_packet.push(JSON.parse(decrypted.toString()));
+		}
+		packet.splice(0, packet.length, ...new_packet);
+		next();
+	});
+	socket.on('secure_req', (public_key)=>{
+		if(!is_key(public_key))
+			return console.error('socket sent bad publicKey');
+		const keypair = sodium.crypto_box_keypair();
+		socket.s_public_key = keypair.publicKey;
+		socket.s_private_key = keypair.secretKey;
+		socket.c_public_key = Buffer.from(public_key, 'hex');
+		socket.is_secure_protocol = true;
+		socket.emit('secure_res', socket.s_public_key.toString('hex'));
+	});
+	//does nnot allow for callback function at this stage
+	socket.s_emit = (...args)=>{
+		if(!socket.is_secure_protocol) return socket.emit(...args);
+		let digests = [args[0]];
+		for(let i = 1; i < args.length; i++){
+			console.log(socket.c_public_key);
+			const digest = sodium.crypto_box_seal(Buffer.from(JSON.stringify(args[i])), socket.c_public_key).toString('hex');
+			digests.push(digest);
+		}
+		socket.emit(...digests);
+	};
+
+	socket.s_emit('auth_req');
 	socket.on('auth_res', async (token, device_id)=>{
 		let verification_promise = verify_auth_token(token);
 		let user_id = await verification_promise;
 		if(user_id == -1){
-			socket.emit('auth_status', 'rejected');
+			socket.s_emit('auth_status', 'rejected');
 			return socket.disconnect(true);
 		}
 		//race condition here losing ~1 socket if simultaneous requests from same user
@@ -248,8 +294,19 @@ app.use(express.static('public'));
 app.use(bodyParser.urlencoded({extended:false}));
 app.use(bodyParser.json());
 app.use(cookieParser());
+//add secure json transimission protocol
+//only use for post requests
 app.use(async (req, res, next)=>{
-	req.is_secure_protocol = false;
+	res.is_secure_protocol = false;
+	res.s_send = (to_send)=>{
+		if(!res.is_secure_protocol) return res.send(to_send);
+		const digest = sodium.crypto_box_seal(Buffer.from(JSON.stringify(to_send)), res.res_pkey).toString('hex');
+		const res_obj = {
+			idToken:res.res_idToken,
+			encryptedObject:digest
+		};
+		res.send(res_obj);
+	};
 	if(req.body == null) next();
 	try{
 		if(req.body.hasOwnProperty('encryptedObject')){
@@ -268,25 +325,27 @@ app.use(async (req, res, next)=>{
 						res(row);
 					});
 			});
-			let key_pair_inf = await promise;
-			if(key_pair_inf.expiration < (new Date()).getTime())
+			let keypair_inf = await promise;
+			if(keypair_inf.expiration < (new Date()).getTime())
 				return res.send({keypairStatus:false});
 			let decrypted = sodium.crypto_box_seal_open(
 				Buffer.from(req_obj.digest, 'hex'),
-				key_pair_inf.server_public_key,
-				key_pair_inf.server_private_key);
+				keypair_inf.server_public_key,
+				keypair_inf.server_private_key);
 			//creating a seperate variable so that the json error can be caught
 			//without adding an attribute to the request object
 			let decrypted_obj = JSON.parse(decrypted);
 			req.is_secure_protocol = true;
 			req.decrypted_obj = decrypted_obj;
+			res.res_pKey = keypair_inf.client_public_key;
+			res.res_idToken = req_obj.idToken
 		}
 	}
 	catch(err){
 		console.error(err);
 	}
 	next();
-})
+});
 
 /********************
  *** GET REQUESTS ***
@@ -381,8 +440,8 @@ app.get('/create_account', (req, res)=>{
  		console.error(err.message);
  		res.status(500).end();
  	}
- 	res.send(res_obj);
- });
+ 	res.s_send(res_obj);
+});
 
 app.post('/salts_req', (req, res)=>{
     attr_mapping = {
@@ -402,14 +461,14 @@ app.post('/salts_req', (req, res)=>{
         const username = body_obj.username.toLowerCase();
         db.get('select client_salt, keygen_salt from Users where username=?', [username], (err, row)=>{
             if(err){return res.status(500).end();}
-            if(!row){return res.send({error:'user does not exist'});}
-            res.send({clientSalt:row.client_salt, keygenSalt:row.keygen_salt});
+            if(!row){return res.s_send({error:'user does not exist'});}
+            res.s_send({clientSalt:row.client_salt, keygenSalt:row.keygen_salt});
         });
     }
     else if(body_obj.action === 'new'){
         const client_salt = generate_salt();
         const keygen_salt = generate_salt();
-        res.send({clientSalt:client_salt, keygenSalt:keygen_salt});
+        res.s_send({clientSalt:client_salt, keygenSalt:keygen_salt});
     }
     else{return res.status(400).end();}
 });
@@ -425,10 +484,10 @@ app.post('/user_req', async (req, res)=>{
     if(is_bad_request(body_obj, attr_mapping)){return res.status(400).end();}
     let verification_promise = verify_auth_token(body_obj.authToken);
     const user_id = await verification_promise;
-    if(user_id == -1) return res.send({authStatus:false, error:'auth_token not valid'});
+    if(user_id == -1) return res.s_send({authStatus:false, error:'auth_token not valid'});
     db.get('select username from Users where UserID=?', [user_id], (err, row) =>{
         if(err) return res.status(500).end();
-        res.send({username:row.username});
+        res.s_send({username:row.username});
     });
 });
 
@@ -441,7 +500,7 @@ app.post('/auth_req', (req, res)=>{
         },
         optional:{}
     };
-    const inval_login = ()=>{res.send({error:"invalid login credentials"});}
+    const inval_login = ()=>{res.s_send({error:"invalid login credentials"});}
     const body_obj = (req.hasOwnProperty('decrypted_obj')) ? req.decrypted_obj : req.body;
     if(is_bad_request(body_obj, attr_mapping)){return res.status(400).end();}
     const username = body_obj.username.toLowerCase();
@@ -470,7 +529,7 @@ app.post('/auth_req', (req, res)=>{
                         if(err){console.error(err.message);return res.status(500).end();}
                         res.cookie(cookie_publicKey, public_key);
                         res.cookie(cookie_authToken, token);
-                        res.send({authToken:token});
+                        res.s_send({authToken:token});
                     });
             }
         };
@@ -481,7 +540,7 @@ app.post('/auth_req', (req, res)=>{
             db.get('select DeviceID from Devices where UserID=? AND public_key=?',[
                 row.UserID, body_obj.publicKey], (err, row) =>{
                     if(err){console.error(err.message);return res.status(500).end();}
-                    if(!row){return res.send({error:'unrecognised public key, please retry login'});}
+                    if(!row){return res.s_send({error:'unrecognised public key, please retry login'});}
                     db.get('select AuthTokenID from Authtokens where token=?', [token], callback_y);
                 });
         }
@@ -518,13 +577,13 @@ app.post('/create_account', (req, res)=>{
             break;
         }
     }
-    if(!isalphanumeric) return res.send({error:'only alphanumeric characters allowed in username'});
+    if(!isalphanumeric) return res.s_send({error:'only alphanumeric characters allowed in username'});
     db.get('select username from Users where username=?', [username], (err, row) => {
         if(err){console.error(err.message);return res.status(500).end();}
-        if(row){return res.send({error:'user already exists'});}
+        if(row){return res.s_send({error:'user already exists'});}
         db.get('select email from Users where email=?', body_obj['email'], (err, row)=>{
             if(err){console.error(err.message);return res.status(500).end();}
-            if(row){return res.send({error:'email already in use'});}
+            if(row){return res.s_send({error:'email already in use'});}
             const server_salt = generate_salt();
             const pw_hash = new SHA3(256);
             //ignoring non-conversion from hexstring to buffer for req hash
@@ -542,7 +601,7 @@ app.post('/create_account', (req, res)=>{
                 body_obj.keygenSalt,
                 server_salt,
                 body_obj.publicKey], function(err){
-                if(err){console.error(err.message);return res.send(500).end();}
+                if(err){console.error(err.message);return res.s_send(500).end();}
                 let token = generate_hash_token();
                 const expiration = (new Date()).getTime() + token_valid_ms;
                 const user_id = this.lastID;
@@ -561,7 +620,7 @@ app.post('/create_account', (req, res)=>{
                                 if(err){console.error(err.message);return res.status(500);}
                                 res.cookie(cookie_authToken, token);
                                 res.cookie(cookie_publicKey, body_obj.publicKey);
-                                res.send({authToken:token});
+                                res.s_send({authToken:token});
                             });
                     }
                 };
@@ -590,7 +649,7 @@ app.post('/convo_req', async (req, res) =>{
     if(is_bad_request(body_obj, attr_mapping)){return res.status(400).end();}
     let verification_promise = verify_auth_token(body_obj.authToken);
     const user_id = await verification_promise;
-    if(user_id == -1) return res.send({authStatus:false, error:'auth_token not valid'});
+    if(user_id == -1) return res.s_send({authStatus:false, error:'auth_token not valid'});
     let conversations_promise = new Promise((res, rej)=>{
         db.all(`select Conversations.ConversationID, default_name, custom_name from UserConversationMap
             LEFT JOIN Conversations on Conversations.ConversationID=UserConversationMap.ConversationID
@@ -645,7 +704,7 @@ app.post('/convo_req', async (req, res) =>{
         console.error(err.message);
         return res.status(500).end();
     }
-    return res.send({conversationObjects:conversation_obj_list});
+    return res.s_send({conversationObjects:conversation_obj_list});
 });
 
 app.post('/messages_req', async (req, res)=>{
@@ -662,7 +721,7 @@ app.post('/messages_req', async (req, res)=>{
     if(is_bad_request(body_obj, attr_mapping)){return res.status(400).end();}
     let verification_promise = verify_auth_token(body_obj.authToken);
     const user_id = await verification_promise;
-    if(user_id == -1) return res.send({authStatus:false, error:'auth_token not valid'});
+    if(user_id == -1) return res.s_send({authStatus:false, error:'auth_token not valid'});
     let permission_promise = new Promise((res, rej)=>{
         db.get('select UserID from UserConversationMap where UserID=? and ConversationID=?', [user_id, body_obj.conversationID], (err, row)=>{
             if(err) throw err;
@@ -727,7 +786,7 @@ app.post('/messages_req', async (req, res)=>{
         console.error(err.message);
         return res.status(500).end();
     }
-    res.send({messageObjects:message_objs});
+    res.s_send({messageObjects:message_objs});
 });
 
 app.post('/keys_req', (req, res)=>{
@@ -742,9 +801,9 @@ app.post('/keys_req', (req, res)=>{
     if(is_bad_request(body_obj, attr_mapping)){return res.status(400).end();}
     db.get('select UserID, expiration from AuthTokens where token=?', [body_obj.authToken], function(err, row){
         if(err){console.error(err.message); return res.status(500).end();}
-        if(!row){return res.send({auth_status:false, error:'auth_token not valid'});}
+        if(!row){return res.s_send({auth_status:false, error:'auth_token not valid'});}
         if(row.expiration < (new Date()).getTime()){
-            return res.send({auth_status:false, error:'session has expired'});
+            return res.s_send({auth_status:false, error:'session has expired'});
         }
         const user_id = row.UserID;
         //refresh token if hasn't been refreshsed for an hour
@@ -789,7 +848,7 @@ app.post('/keys_req', (req, res)=>{
                                 new_user_key.key = rows[i].pw_public_key;
                                 user_key_list.push(new_user_key);
                             }
-                            res.send({
+                            res.s_send({
                                 deviceKeys:device_key_list,
                                 userKeys:user_key_list
                             });
@@ -800,7 +859,7 @@ app.post('/keys_req', (req, res)=>{
 });
 
 //possibly add device id verification here
-app.post('/last_msg_req', async function(req, res){
+app.post('/last_msg_req', async (req, res)=>{
     const attr_mapping = {
         required:{
             'authToken':'string',
@@ -814,7 +873,7 @@ app.post('/last_msg_req', async function(req, res){
     if(is_bad_request(body_obj, attr_mapping)){return res.status(400).end();}
     let verification_promise = verify_auth_token(body_obj.authToken);
     const user_id = await verification_promise;
-    if(user_id == -1) return res.send({authStatus:false, error:'auth_token not valid'});
+    if(user_id == -1) return res.s_send({authStatus:false, error:'auth_token not valid'});
     let permision_promise = new Promise((res, rej)=>{
         db.get('select * from UserConversationMap where UserID=? and ConversationID=?',
             [user_id, body_obj.conversationID], (err, row)=>{
@@ -852,7 +911,7 @@ app.post('/last_msg_req', async function(req, res){
         console.error(err.message);
         return res.status(400).end();
     }
-    res.send({digest:digest});
+    res.s_send({digest:digest});
 });
 
 /*  participants expected in form:
@@ -862,7 +921,7 @@ app.post('/last_msg_req', async function(req, res){
 //must rate limit this
 //bug where duplicate user conversation mapping entries can be created
 //if a single user is enterred multiple times
-app.post('/conversation_create', async function(req, res){
+app.post('/conversation_create', async (req, res)=>{
     req_time = new Date();
     const attr_mapping = {
         required:{
@@ -878,7 +937,7 @@ app.post('/conversation_create', async function(req, res){
     let verification_promise = verify_auth_token(body_obj.authToken);
     const users = body_obj.participants;
     const user_id = await verification_promise;
-    if(user_id == -1) return res.send({authStatus:false, error:'auth_token not valid'});
+    if(user_id == -1) return res.s_send({authStatus:false, error:'auth_token not valid'});
     let user_validation_arr = [];
     for(let i = 0; i < users.length; i++){
         let promise = new Promise((res, rej)=>{
@@ -902,13 +961,13 @@ app.post('/conversation_create', async function(req, res){
             return res.status(500).end();
         }
         if (id == -1){
-            return res.send({error:'some users not found'});
+            return res.s_send({error:'some users not found'});
         }
         if(id == user_id) contains_user = true;
         user_ids.push(id);
     }
     const name = body_obj.hasOwnProperty('name') ? body_obj.name : body_obj.participants.join(' ');
-    if(!contains_user) return res.send({error:'participants did not contain user'});
+    if(!contains_user) return res.s_send({error:'participants did not contain user'});
     insert_promise = new Promise((res, rej)=>{
         db.run('insert into Conversations(default_name, time_created) values(?,?)',
             [name, req_time.getTime()], function(err){
@@ -950,10 +1009,10 @@ app.post('/conversation_create', async function(req, res){
         let socket_ids = Object.keys(map);
         for(let j = 0; j < socket_ids.length; j++){
             console.log('emitting new convo to socket: ', socket_ids[j]);
-            map[socket_ids[j]].socket.emit('new_convo', res_convo_obj);
+            map[socket_ids[j]].socket.s_emit('new_convo', res_convo_obj);
         }
     }
-    res.send(res_convo_obj);
+    res.s_send(res_convo_obj);
 });
 
 /*  digests object expected in form:
@@ -987,7 +1046,7 @@ app.post('/msg_create', async (req, res)=>{
     if(is_bad_request(body_obj, attr_mapping)){return res.status(400).end();}
     let verification_promise = verify_auth_token(body_obj.authToken);
     const user_id = await verification_promise;
-    if(user_id == -1) return res.send({authStatus:false, error:'auth_token not valid'});
+    if(user_id == -1) return res.s_send({authStatus:false, error:'auth_token not valid'});
     let permission_promise = new Promise((res, rej)=>{
         db.get('select * from UserConversationMap where UserID=? and ConversationID=?', [user_id, body_obj.conversationID], (err, row)=>{
             if(err) throw err;
@@ -1041,7 +1100,7 @@ app.post('/msg_create', async (req, res)=>{
     const req_udigs = body_obj.digests.userDigests;
     const req_ddigs = body_obj.digests.deviceDigests;
     if(user_ids.length != req_udigs.length || device_ids.length != req_ddigs.length){
-        return res.send({error:'missing digests, refresh to send messages to new members'});
+        return res.s_send({error:'missing digests, refresh to send messages to new members'});
     }
     let test_set = {};
     for(let i = 0; i < user_ids.length; i++){
@@ -1134,7 +1193,7 @@ app.post('/msg_create', async (req, res)=>{
                 const arr = u_sock_map[req_udigs[i].id];
                 for(let j = 0; j < arr.length; j++){
                     console.log('emitting new message to socket: ', arr[j].id);
-                    arr[j].emit('new_message', body_obj.conversationID, msg_obj);
+                    arr[j].s_emit('new_message', body_obj.conversationID, msg_obj);
                 }
             }
             promises.push(new Promise((res, rej)=>{
@@ -1153,7 +1212,7 @@ app.post('/msg_create', async (req, res)=>{
                 const arr = d_sock_map[req_ddigs[i].id];
                 for(let j = 0; j < arr.length; j++){
                     console.log('emitting new message to socket: ', arr[j].id);
-                    arr[j].emit('new_message', body_obj.conversationID, msg_obj);
+                    arr[j].s_emit('new_message', body_obj.conversationID, msg_obj);
                 }
             }
             promises.push(new Promise((res, rej)=>{
@@ -1183,7 +1242,7 @@ app.post('/msg_create', async (req, res)=>{
         console.error(err.message);
         res.status(500).end();
     }
-    res.send(res_obj);
+    res.s_send(res_obj);
 });
 
 http.listen(3000, (err)=>{

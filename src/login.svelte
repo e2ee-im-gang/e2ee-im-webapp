@@ -85,14 +85,20 @@ const s_ajax_json_req = (req_obj, path)=>{
             req.onreadystatechange = async () =>{
                 if(req.readyState != XMLHttpRequest.DONE) return;
                 if(req.status !== 200) rej(new Error('Error ' + req.status.toString()));
-                let response_obj = JSON.parse(req.response);
-                if(response_obj.hasOwnProperty('authStatus')){
-                    if(response_obj.authStatus !== true){
+                let res_obj = JSON.parse(req.response);
+                if(res_obj.hasOwnProperty('encryptedObject')){
+                    if(res_obj.idToken !== ajax_id_token)
+                        throw new Error('Cannot decrypt response');
+                    const decrypted_digest = crypto_box_seal_open(from_hex(res_obj.encryptedObject, ajax_c_pub_key, ajax_c_priv_key));
+                    res_obj = JSON.parse(decrypted_digest);
+                }
+                if(res_obj.hasOwnProperty('authStatus')){
+                    if(res_obj.authStatus !== true){
                         end_session();
                     }
                 }
-                if(response_obj.hasOwnProperty('keypairStatus')){
-                    if(response_obj.keypairStatus !== true){
+                if(res_obj.hasOwnProperty('keypairStatus')){
+                    if(res_obj.keypairStatus !== true){
                         //technically can infinite loop here if there's an issue with the server
                         //possibly need to lock s_ajax_json_req function while this is occurring
                         let promise = ajax_json_req(req_obj, '/keypair_req');
@@ -111,9 +117,8 @@ const s_ajax_json_req = (req_obj, path)=>{
                         return make_request();
                     }
                 }
-                if(response_obj.hasOwnProperty('error')) rej(new Error(response_obj.error));
-                //at later point this response object will be encrypted
-                res(response_obj);
+                if(res_obj.hasOwnProperty('error')) rej(new Error(res_obj.error));
+                res(res_obj);
             };
         };
         make_request();
